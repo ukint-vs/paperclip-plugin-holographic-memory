@@ -15,14 +15,22 @@ state for the run, and expose an agent tool for targeted recall.
 ## What it does
 
 - Isolated Paperclip memory DB, created on first use.
-- Runtime recall from local SQLite.
-- FTS5/Jaccard/trust-ranked fact search.
+- Automatic recall on `agent.run.started`: searches the DB with the issue's
+  title/description and caches the formatted MEMORY CONTEXT under three scope
+  keys (run, issue, agent) so any later tool call can pick it up.
+- Hybrid search blend: FTS5 + Jaccard + HRR cosine, weighted 0.4/0.3/0.3 and
+  scaled by per-fact trust score.
 - Hermes-style entity extraction and entity-linked recall.
-- Deterministic HRR vectors on inserted facts.
+- Deterministic HRR vectors on every insert; reads use them for real similarity,
+  not a constant.
 - Category memory banks stored as `cat:<category>`.
+- Agent write loop: `add`, `update`, `remove` actions gated by `retainEnabled`,
+  all wrapped in SQLite transactions.
 - Fact feedback that adjusts trust scores.
-- One-time seed script from Paperclip Postgres.
-- No event-driven fact extraction.
+- Two ways to populate the DB: one-time Postgres seed, or Claude-Code-driven
+  curation via `pnpm import:facts`.
+- No event-driven auto-extraction; facts only enter the store via seed, import,
+  or the agent calling `add`.
 
 ## Installation
 
@@ -56,17 +64,33 @@ pnpm paperclipai plugin install paperclip-plugin-holographic-memory
 }
 ```
 
-## Seed from Paperclip Postgres
+`retainEnabled` defaults to `false`. While off, `add`, `update`, and `remove`
+return `Memory retain is disabled. Set retainEnabled=true in plugin config.`
+Read actions are gated by `recallEnabled`.
 
-Paperclip data can be imported into the isolated memory DB with:
+## Populating the DB
+
+Two paths, used together or separately.
+
+### 1. Claude-Code-driven curation (recommended for rich facts)
+
+Drive Claude Code through your Paperclip data (issues, comments, agent maps,
+methodology docs), produce a JSON array of facts, then import:
+
+```bash
+pnpm import:facts /path/to/curated-facts.json
+pnpm import:facts /path/to/curated-facts.json --dry-run
+pnpm import:facts /path/to/curated-facts.json --db-path ~/.paperclip/instances/default/hermes-memory.db
+```
+
+`scripts/CURATION.md` documents the durable-fact rules, taxonomy, trust score
+guide, and the JSON schema (`{ content, category, tags?, trustScore? }`). Import
+is idempotent — re-running with the same content returns the existing factId.
+
+### 2. One-shot Postgres seed (fast bulk import)
 
 ```bash
 DATABASE_URL=postgres://postgres:postgres@localhost:54329/postgres pnpm seed:paperclip
-```
-
-Options:
-
-```bash
 pnpm seed:paperclip --dry-run
 pnpm seed:paperclip --database-url postgres://user:pass@localhost:54329/paperclip
 pnpm seed:paperclip --db-path ~/.paperclip/instances/default/hermes-memory.db
@@ -75,7 +99,7 @@ pnpm seed:paperclip --db-path ~/.paperclip/instances/default/hermes-memory.db
 The seeder reads `issues`, `runs`, `agents`, and `comments` when present. It
 extracts completed issue resolutions, recurring run errors, agent capability
 notes, and workflow decisions. It writes facts with `paperclip:*` categories and
-deduplicates by fact content.
+deduplicates by content.
 
 ## Agent tool
 
@@ -89,14 +113,30 @@ deduplicates by fact content.
 }
 ```
 
-Supported actions mirror the useful subset of Hermes `fact_store`:
+Read actions (gated by `recallEnabled`):
 
-- `search`: FTS/Jaccard/trust-ranked keyword recall.
+- `search`: FTS5 + Jaccard + HRR + trust-ranked recall.
 - `probe`: facts linked to one entity.
 - `related`: HRR-based entity adjacency.
 - `reason`: facts linked to all provided entities.
-- `list`: browse facts by trust/category.
-- `feedback`: update trust using `fact_id` and `helpful`.
+- `list`: browse facts by trust/category (returns JSON).
+- `feedback`: update trust using `fact_id` and `helpful` (returns JSON).
+- `recall_context`: return the cached MEMORY CONTEXT for a run/issue/agent.
+  Resolves explicit `run_id` / `issue_id` / `agent_id`, then falls back to
+  the calling tool's `runCtx.runId` / `runCtx.agentId`, then to a live
+  `query` if provided. Returns guidance text if nothing matches.
+
+Write actions (gated by `retainEnabled`, all return JSON):
+
+- `add`: insert a fact (`content` required; optional `category`, `tags`,
+  `trust_score`). Idempotent on `content` — re-adding returns the existing
+  `factId` with `inserted: false`.
+- `update`: change `content`, `category`, `tags`, or `trust_delta` for a
+  `fact_id`. Re-extracts entities and recomputes the HRR vector when content
+  changes. Returns `{ updated: false, reason: "duplicate_content" }` on a
+  content collision.
+- `remove`: hard-delete by `fact_id`. Drops entity links and rebuilds the
+  affected category bank.
 
 Returns ranked facts formatted as:
 
@@ -108,17 +148,25 @@ MEMORY CONTEXT:
 ## How it works
 
 ```text
-agent.run.started
-  -> recall(issue title + description)
-  -> store formatted MEMORY CONTEXT in plugin state for this run
+agent.run.started (PluginEvent)
+  -> recall(issue title + description) using event.companyId
+  -> write formatted MEMORY CONTEXT to ctx.state under three scope keys:
+       run:<runId>:recall:context
+       issue:<issueId>:recall:context
+       agent:<agentId>:recall:context
 
 agent running...
-  -> holographic_memory_search(action="search" | "probe" | "reason" | ...)
+  -> holographic_memory_search(action="recall_context")
+       resolves the cached state via run/issue/agent (or runCtx fallback)
+  -> holographic_memory_search(action="search"|"probe"|"reason"|...)
+       targeted retrieval against the DB
+  -> holographic_memory_search(action="add"|"update"|"remove")
+       only when retainEnabled=true; wrapped in a SQLite transaction
 
-seed:paperclip
-  -> read Paperclip Postgres
-  -> extract durable facts
-  -> insert through MemoryStore so entities, HRR vectors, and banks stay consistent
+import:facts / seed:paperclip
+  -> read curated JSON or Paperclip Postgres
+  -> insert through MemoryStore so entities, HRR vectors, FTS index, and
+     category banks stay consistent
 ```
 
 Memory is keyed by the isolated SQLite file, not by a Paperclip session or run.
