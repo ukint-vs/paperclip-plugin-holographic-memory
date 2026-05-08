@@ -3,12 +3,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
 import type { ScopeKey, ToolRunContext } from "@paperclipai/plugin-sdk";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   ACTION_HANDLERS,
   buildToolDescription,
   dispatchAction,
+  extractRunFields,
   extractRunStartedFields,
+  handleRunFinished,
   handleRunStarted
 } from "../src/worker.js";
 import { MemoryStore } from "../src/memory-store.js";
@@ -519,6 +521,364 @@ describe("dispatchAction — store registry", () => {
       FAKE_RUN_CTX
     );
     expect(inA.content).toContain("only-in-A");
+  });
+});
+
+describe("handleRunFinished — auto-extract on agent.run.finished (#11)", () => {
+  const RUN_WINDOW = {
+    startedAt: "2026-05-08T12:00:00.000Z",
+    finishedAt: "2026-05-08T12:30:00.000Z"
+  };
+  const IN_WINDOW_AT = "2026-05-08T12:15:00.000Z";
+  const OUT_OF_WINDOW_AT = "2026-05-08T13:00:00.000Z";
+
+  function fakeLogger() {
+    const info: Array<unknown[]> = [];
+    const warn: Array<unknown[]> = [];
+    const error: Array<unknown[]> = [];
+    return {
+      info,
+      warn,
+      error,
+      logger: {
+        info: (...args: unknown[]) => info.push(args),
+        warn: (...args: unknown[]) => warn.push(args),
+        error: (...args: unknown[]) => error.push(args)
+      }
+    };
+  }
+
+  function buildEvent(overrides: Partial<{
+    runId: string;
+    agentId: string;
+    issueId: string;
+    companyId: string;
+    startedAt: string;
+    finishedAt: string;
+  }> = {}) {
+    return {
+      runId: "run-fin",
+      agentId: "agent-fin",
+      issueId: "issue-fin",
+      companyId: "co-fin",
+      ...RUN_WINDOW,
+      ...overrides
+    };
+  }
+
+  it("happy path: scans body + in-window human comments, inserts facts with provenance", async () => {
+    const dbPath = createDb();
+    const { logger, info } = fakeLogger();
+    const ctx = {
+      logger,
+      issues: {
+        get: async () => ({
+          title: "Plan: index storage",
+          description: "I prefer SQLite for the index path."
+        }),
+        listComments: async () => [
+          // In-window human comment with regex bait → extracted
+          {
+            authorUserId: "user-1",
+            authorAgentId: null,
+            body: "we decided to use Postgres after all.",
+            createdAt: IN_WINDOW_AT
+          },
+          // In-window AGENT comment with regex bait → filtered out (D12)
+          {
+            authorUserId: null,
+            authorAgentId: "agent-bot",
+            body: "I prefer Helix as my editor.",
+            createdAt: IN_WINDOW_AT
+          },
+          // Out-of-window human comment → filtered out (D13)
+          {
+            authorUserId: "user-2",
+            authorAgentId: null,
+            body: "I always run typecheck before commit.",
+            createdAt: OUT_OF_WINDOW_AT
+          }
+        ]
+      }
+    };
+
+    const result = await handleRunFinished(ctx, buildEvent(), baseConfig(dbPath));
+
+    // Body contributes one user_pref ("I prefer SQLite..."); in-window
+    // comment contributes one project ("we decided..."). Filtered ones
+    // produce nothing.
+    expect(result?.inserted).toBe(2);
+    // Info log fires once with the count.
+    expect(info).toHaveLength(1);
+    expect(String(info[0]?.[0])).toMatch(/inserted 2 facts/);
+
+    // Round-trip: facts in the DB carry source="auto" + run/agent IDs.
+    const store = new MemoryStore(dbPath);
+    try {
+      const found = store.search("Postgres SQLite", { limit: 10, minTrust: 0 });
+      const auto = found.filter((f) => f.source === "auto");
+      expect(auto.length).toBeGreaterThanOrEqual(2);
+      for (const fact of auto) {
+        expect(fact.agentId).toBe("agent-fin");
+        expect(fact.runId).toBe("run-fin");
+        expect(fact.trustScore).toBeCloseTo(0.3, 5);
+      }
+    } finally {
+      store.close();
+    }
+  });
+
+  it("retainEnabled=false → returns without calling addFact or logging", async () => {
+    const dbPath = createDb();
+    const { logger, info, warn, error } = fakeLogger();
+    let listCommentsCalls = 0;
+    let getCalls = 0;
+    const ctx = {
+      logger,
+      issues: {
+        get: async () => {
+          getCalls += 1;
+          return { title: "x", description: "I prefer X for everything." };
+        },
+        listComments: async () => {
+          listCommentsCalls += 1;
+          return [];
+        }
+      }
+    };
+
+    const result = await handleRunFinished(
+      ctx,
+      buildEvent(),
+      baseConfig(dbPath, { retainEnabled: false })
+    );
+
+    expect(result).toBeUndefined();
+    expect(getCalls).toBe(0);
+    expect(listCommentsCalls).toBe(0);
+    expect(info).toHaveLength(0);
+    expect(warn).toHaveLength(0);
+    expect(error).toHaveLength(0);
+  });
+
+  it("event.issueId undefined → early-return, no IO, no log", async () => {
+    const dbPath = createDb();
+    const { logger, info, warn } = fakeLogger();
+    let getCalls = 0;
+    const ctx = {
+      logger,
+      issues: {
+        get: async () => {
+          getCalls += 1;
+          return null;
+        },
+        listComments: async () => []
+      }
+    };
+
+    const result = await handleRunFinished(
+      ctx,
+      buildEvent({ issueId: undefined as unknown as string }),
+      baseConfig(dbPath)
+    );
+
+    expect(result).toBeUndefined();
+    expect(getCalls).toBe(0);
+    expect(info).toHaveLength(0);
+    expect(warn).toHaveLength(0);
+  });
+
+  it("missing startedAt/finishedAt → fail-closed: warn log, no IO, no info log", async () => {
+    const dbPath = createDb();
+    const { logger, info, warn } = fakeLogger();
+    let getCalls = 0;
+    const ctx = {
+      logger,
+      issues: {
+        get: async () => {
+          getCalls += 1;
+          return null;
+        },
+        listComments: async () => []
+      }
+    };
+
+    const result = await handleRunFinished(
+      ctx,
+      buildEvent({ startedAt: undefined as unknown as string, finishedAt: undefined as unknown as string }),
+      baseConfig(dbPath)
+    );
+
+    expect(result).toBeUndefined();
+    expect(getCalls).toBe(0);
+    // The warn log records the skip reason for visibility.
+    expect(warn).toHaveLength(1);
+    expect(String(warn[0]?.[0])).toMatch(/missing startedAt\/finishedAt/);
+    // No info log on the fail-closed path (clarification C9).
+    expect(info).toHaveLength(0);
+  });
+
+  it("ctx.issues.get rejects → outer catch logs error, no rethrow", async () => {
+    const dbPath = createDb();
+    const { logger, error } = fakeLogger();
+    const ctx = {
+      logger,
+      issues: {
+        get: async () => {
+          throw new Error("boom: issues.get");
+        },
+        listComments: async () => []
+      }
+    };
+
+    // Must not throw — the SDK contract is that handlers swallow errors.
+    await expect(handleRunFinished(ctx, buildEvent(), baseConfig(dbPath))).resolves.toBeUndefined();
+    expect(error).toHaveLength(1);
+    expect(String(error[0]?.[0])).toMatch(/auto-extract: failed for run/);
+  });
+
+  it("ctx.issues.listComments rejects → outer catch logs error, no rethrow", async () => {
+    const dbPath = createDb();
+    const { logger, error } = fakeLogger();
+    const ctx = {
+      logger,
+      issues: {
+        get: async () => ({ title: "ok", description: "I prefer X for everything." }),
+        listComments: async () => {
+          throw new Error("boom: listComments");
+        }
+      }
+    };
+
+    await expect(handleRunFinished(ctx, buildEvent(), baseConfig(dbPath))).resolves.toBeUndefined();
+    expect(error).toHaveLength(1);
+    expect(String(error[0]?.[0])).toMatch(/auto-extract: failed for run/);
+  });
+
+  it("T3: middle addFact rejects → inner catch fires, peers still inserted", async () => {
+    const dbPath = createDb();
+    const { logger, info, warn } = fakeLogger();
+    const ctx = {
+      logger,
+      issues: {
+        get: async () => ({
+          title: "Plan",
+          description: "I prefer A for everything." // produces 1 fact (user_pref)
+        }),
+        listComments: async () => [
+          {
+            authorUserId: "user-1",
+            body: "we decided to ship.", // produces 1 fact (project)
+            createdAt: IN_WINDOW_AT
+          },
+          {
+            authorUserId: "user-1",
+            body: "I always run typecheck.", // produces 1 fact (user_pref) — duplicate category, dedup
+            createdAt: IN_WINDOW_AT
+          }
+        ]
+      }
+    };
+
+    // Spy on addFact to make the second call throw.
+    const calls: number[] = [];
+    const realAddFact = MemoryStore.prototype.addFact;
+    const spy = vi
+      .spyOn(MemoryStore.prototype, "addFact")
+      .mockImplementation(function (this: MemoryStore, fact) {
+        calls.push(calls.length + 1);
+        if (calls.length === 2) {
+          throw new Error("boom: addFact");
+        }
+        return realAddFact.call(this, fact);
+      });
+
+    try {
+      const result = await handleRunFinished(ctx, buildEvent(), baseConfig(dbPath));
+      // 3 hits attempted, 1 threw → 2 inserted (1st and 3rd).
+      expect(result?.inserted).toBe(2);
+      // Inner catch logs the failure.
+      expect(warn.length).toBeGreaterThanOrEqual(1);
+      expect(String(warn[0]?.[0])).toMatch(/addFact failed/);
+      // Info log still fires with the inserted count.
+      expect(info).toHaveLength(1);
+      expect(String(info[0]?.[0])).toMatch(/inserted 2 facts/);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("zero-hit run still logs once with inserted 0", async () => {
+    const dbPath = createDb();
+    const { logger, info } = fakeLogger();
+    const ctx = {
+      logger,
+      issues: {
+        get: async () => ({ title: "no triggers", description: "just a normal task." }),
+        listComments: async () => []
+      }
+    };
+
+    const result = await handleRunFinished(ctx, buildEvent(), baseConfig(dbPath));
+    expect(result?.inserted).toBe(0);
+    expect(info).toHaveLength(1);
+    expect(String(info[0]?.[0])).toMatch(/inserted 0 facts/);
+  });
+
+  it("all-agent-author + all-out-of-window comments → 0 from comments, body still scanned", async () => {
+    const dbPath = createDb();
+    const { logger, info } = fakeLogger();
+    const ctx = {
+      logger,
+      issues: {
+        get: async () => ({
+          title: "body trigger",
+          description: "the project requires SQLite for storage."
+        }),
+        listComments: async () => [
+          { authorUserId: null, authorAgentId: "bot", body: "we decided X", createdAt: IN_WINDOW_AT },
+          { authorUserId: "u", body: "we decided Y", createdAt: OUT_OF_WINDOW_AT }
+        ]
+      }
+    };
+
+    const result = await handleRunFinished(ctx, buildEvent(), baseConfig(dbPath));
+    // Only the body's project-pattern hit lands.
+    expect(result?.inserted).toBe(1);
+    expect(info).toHaveLength(1);
+    expect(String(info[0]?.[0])).toMatch(/inserted 1 facts/);
+  });
+});
+
+describe("extractRunFields (renamed from extractRunStartedFields, +startedAt/finishedAt)", () => {
+  it("pulls startedAt/finishedAt from payload", () => {
+    const event = {
+      eventType: "agent.run.finished",
+      entityId: "run-fin",
+      actorId: "agent-fin",
+      companyId: "co-fin",
+      payload: {
+        issueId: "issue-fin",
+        startedAt: "2026-05-08T12:00:00.000Z",
+        finishedAt: "2026-05-08T12:30:00.000Z"
+      }
+    };
+    expect(extractRunFields(event)).toEqual({
+      runId: "run-fin",
+      agentId: "agent-fin",
+      issueId: "issue-fin",
+      companyId: "co-fin",
+      startedAt: "2026-05-08T12:00:00.000Z",
+      finishedAt: "2026-05-08T12:30:00.000Z"
+    });
+  });
+
+  it("omits startedAt/finishedAt when absent (no { startedAt: undefined } leak)", () => {
+    const event = { runId: "r", issueId: "i" };
+    const out = extractRunFields(event);
+    expect(out).toEqual({ runId: "r", issueId: "i" });
+    expect("startedAt" in out).toBe(false);
+    expect("finishedAt" in out).toBe(false);
   });
 });
 

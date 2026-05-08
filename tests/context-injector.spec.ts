@@ -9,7 +9,10 @@ const fact: MemoryFact = {
   tags: "paperclip,memory",
   trustScore: 0.75,
   retrievalCount: 0,
-  helpfulCount: 0
+  helpfulCount: 0,
+  source: null,
+  agentId: null,
+  runId: null
 };
 
 describe("context formatting", () => {
