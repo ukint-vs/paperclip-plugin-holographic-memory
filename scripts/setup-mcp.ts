@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import TOML from "@iarna/toml";
+import { atomicWrite } from "../src/atomic-write.js";
 
 // Idempotent merger that registers the holographic-memory MCP server in the
 // user's Claude Code (~/.claude/settings.json -> mcpServers) and Codex
@@ -25,7 +26,7 @@ const DEFAULT_DB_PATH = "~/.paperclip/instances/default/hermes-memory.db";
 const DEFAULT_COMMAND = "npx";
 const DEFAULT_ARGS = ["paperclip-holographic-memory-mcp"];
 
-interface CliOptions {
+export interface CliOptions {
   print: boolean;
   dryRun: boolean;
   refresh: boolean;
@@ -86,7 +87,7 @@ function buildEnv(opts: CliOptions): Record<string, string> {
   };
 }
 
-function buildClaudeEntry(opts: CliOptions): Record<string, unknown> {
+export function buildClaudeEntry(opts: CliOptions): Record<string, unknown> {
   return {
     command: opts.command,
     args: opts.args,
@@ -101,14 +102,6 @@ async function pathExists(target: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-async function atomicWrite(target: string, contents: string, mode = 0o600): Promise<void> {
-  const dir = path.dirname(target);
-  await fs.mkdir(dir, { recursive: true });
-  const tmp = `${target}.tmp.${process.pid}`;
-  await fs.writeFile(tmp, contents, { mode });
-  await fs.rename(tmp, target);
 }
 
 async function backup(target: string): Promise<void> {
@@ -180,7 +173,7 @@ async function applyClaude(opts: CliOptions): Promise<MergeOutcome> {
 // (would lose comments). Validates that the resulting file parses cleanly.
 // ---------------------------------------------------------------------------
 
-function buildCodexBlock(opts: CliOptions): string {
+export function buildCodexBlock(opts: CliOptions): string {
   // Inline-table env keeps the block compact and one-paste; matches the
   // style of the [mcp_servers.context7] block already in the user's config.
   const argsLiteral = JSON.stringify(opts.args);

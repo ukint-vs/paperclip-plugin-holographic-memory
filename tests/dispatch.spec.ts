@@ -1,6 +1,3 @@
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   closeStores,
@@ -8,22 +5,8 @@ import {
   getStore,
 } from "../src/dispatch.js";
 import { writeRecallCache } from "../src/recall-cache.js";
-import type { HolographicMemoryConfig, RecallState } from "../src/types.js";
-
-function tempDb(): string {
-  return path.join(mkdtempSync(path.join(tmpdir(), "dispatch-")), "memory.db");
-}
-
-function baseConfig(dbPath: string, overrides: Partial<HolographicMemoryConfig> = {}): HolographicMemoryConfig {
-  return {
-    dbPath,
-    recallEnabled: true,
-    retainEnabled: true,
-    minTrustScore: 0.3,
-    maxFactsPerRecall: 10,
-    ...overrides,
-  };
-}
+import type { RecallState } from "../src/types.js";
+import { baseConfig, tempDb } from "./helpers.js";
 
 afterEach(() => {
   closeStores();

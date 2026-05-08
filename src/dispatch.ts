@@ -5,7 +5,7 @@
 
 import { formatFactsAsText } from "./context-injector.js";
 import { MemoryStore } from "./memory-store.js";
-import { readRecallCache } from "./recall-cache.js";
+import { readRecallCache, type RecallCacheScope } from "./recall-cache.js";
 import type { HolographicMemoryConfig } from "./types.js";
 
 export interface ToolParams {
@@ -239,7 +239,7 @@ export async function dispatchStandaloneAction(
     // difference between "the worker pre-fetched memory" and "we did a live
     // search". Per A3 decision: do NOT silently formatted-as-MEMORY-CONTEXT
     // a live search result, because the agent strategy may branch on it.
-    const fileLookups: Array<["run" | "issue" | "agent", string]> = [];
+    const fileLookups: Array<[RecallCacheScope, string]> = [];
     if (params.run_id) fileLookups.push(["run", params.run_id]);
     if (params.issue_id) fileLookups.push(["issue", params.issue_id]);
     if (params.agent_id) fileLookups.push(["agent", params.agent_id]);

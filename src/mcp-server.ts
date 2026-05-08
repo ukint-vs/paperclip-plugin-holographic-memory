@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { homedir } from "node:os";
-import path from "node:path";
+import { DEFAULT_DB_PATH, expandHome } from "./config.js";
 import { closeStores, dispatchStandaloneAction, type ToolParams } from "./dispatch.js";
 import {
   HOLO_MEMORY_TOOL_DESCRIPTION,
@@ -16,14 +15,6 @@ import type { HolographicMemoryConfig } from "./types.js";
 // [mcp_servers.holographic-memory]). Reads the same SQLite DB as the
 // Paperclip worker and the same on-disk recall cache. See README "Using with
 // claude_local and codex_local" for setup; see issue #20 for why this exists.
-
-const DEFAULT_DB_PATH = "~/.paperclip/instances/default/hermes-memory.db";
-
-function expandHome(input: string): string {
-  if (input === "~") return homedir();
-  if (input.startsWith("~/")) return path.join(homedir(), input.slice(2));
-  return input;
-}
 
 function envBool(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined) return fallback;

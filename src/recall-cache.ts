@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { atomicWrite } from "./atomic-write.js";
 import type { RecallState } from "./types.js";
 
 // Cross-process recall pre-fetch cache.
@@ -66,17 +67,18 @@ export async function writeRecallCache(
   if (ids.issueId) writes.push(["issue", ids.issueId]);
   if (ids.agentId) writes.push(["agent", ids.agentId]);
 
-  for (const [scope, scopeId] of writes) {
-    const target = cachePath(dbPath, scope, scopeId);
-    try {
-      await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
-      const tmp = `${target}.tmp.${process.pid}`;
-      await fs.writeFile(tmp, payload, { mode: 0o600 });
-      await fs.rename(tmp, target);
-    } catch (error) {
-      log(`[holographic-memory] recall-cache write failed for ${scope}=${scopeId}: ${(error as Error).message}`);
-    }
-  }
+  // Parallel across scopes (different files, no shared state). Each branch
+  // is independently best-effort; one failed scope must not poison the others.
+  await Promise.all(
+    writes.map(async ([scope, scopeId]) => {
+      const target = cachePath(dbPath, scope, scopeId);
+      try {
+        await atomicWrite(target, payload, 0o600);
+      } catch (error) {
+        log(`[holographic-memory] recall-cache write failed for ${scope}=${scopeId}: ${(error as Error).message}`);
+      }
+    }),
+  );
 }
 
 // Best-effort read. Returns undefined on any miss (file missing, parse error,
@@ -106,24 +108,32 @@ export async function gcStaleCache(
   log: (message: string) => void = () => undefined,
 ): Promise<void> {
   const root = recallCacheRoot(dbPath);
-  for (const scope of Object.keys(SCOPE_DIRS) as RecallCacheScope[]) {
-    const dir = path.join(root, SCOPE_DIRS[scope]);
-    let entries: string[];
-    try {
-      entries = await fs.readdir(dir);
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      const file = path.join(dir, entry);
+  // Three scopes in parallel, and inside each scope the per-file stat+unlink
+  // pairs in parallel as well. With 100 stale files × 3 scopes the previous
+  // sequential implementation issued 300 serial syscalls; this collapses to
+  // ~one round-trip per scope.
+  await Promise.all(
+    (Object.keys(SCOPE_DIRS) as RecallCacheScope[]).map(async (scope) => {
+      const dir = path.join(root, SCOPE_DIRS[scope]);
+      let entries: string[];
       try {
-        const stat = await fs.stat(file);
-        if (now - stat.mtimeMs > maxAgeMs) {
-          await fs.unlink(file);
-        }
-      } catch (error) {
-        log(`[holographic-memory] recall-cache gc failed for ${file}: ${(error as Error).message}`);
+        entries = await fs.readdir(dir);
+      } catch {
+        return;
       }
-    }
-  }
+      await Promise.all(
+        entries.map(async (entry) => {
+          const file = path.join(dir, entry);
+          try {
+            const stat = await fs.stat(file);
+            if (now - stat.mtimeMs > maxAgeMs) {
+              await fs.unlink(file);
+            }
+          } catch (error) {
+            log(`[holographic-memory] recall-cache gc failed for ${file}: ${(error as Error).message}`);
+          }
+        }),
+      );
+    }),
+  );
 }

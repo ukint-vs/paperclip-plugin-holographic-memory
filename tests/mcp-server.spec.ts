@@ -1,13 +1,7 @@
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { closeStores } from "../src/dispatch.js";
 import { createServer, resolveStandaloneConfig } from "../src/mcp-server.js";
-
-function tempDb(): string {
-  return path.join(mkdtempSync(path.join(tmpdir(), "mcp-server-")), "memory.db");
-}
+import { tempDb } from "./helpers.js";
 
 afterEach(() => {
   closeStores();

@@ -1,6 +1,5 @@
 import fs from "node:fs/promises";
-import { mkdtempSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { statSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -11,10 +10,7 @@ import {
   writeRecallCache,
 } from "../src/recall-cache.js";
 import type { RecallState } from "../src/types.js";
-
-function tempDb(): string {
-  return path.join(mkdtempSync(path.join(tmpdir(), "recall-cache-")), "memory.db");
-}
+import { tempDb } from "./helpers.js";
 
 function fixtureState(overrides: Partial<RecallState> = {}): RecallState {
   return {

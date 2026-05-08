@@ -2,7 +2,13 @@ import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 import type { ScopeKey, ToolResult, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { formatFactsAsText, formatFactsForPrompt } from "./context-injector.js";
 import { resolvePluginConfig } from "./config.js";
-import { gcStaleCache, readRecallCache, writeRecallCache } from "./recall-cache.js";
+import {
+  gcStaleCache,
+  readRecallCache,
+  writeRecallCache,
+  type RecallCacheScope,
+} from "./recall-cache.js";
+import { HOLO_MEMORY_TOOL_DESCRIPTION, toJsonSchema } from "./tool-schema.js";
 import {
   READ_ACTIONS,
   WRITE_ACTIONS,
@@ -147,8 +153,18 @@ export async function handleRunStarted(
   if (event.runId) ids.runId = event.runId;
   if (event.issueId) ids.issueId = event.issueId;
   if (event.agentId) ids.agentId = event.agentId;
-  await writeRecallCache(config.dbPath, state, ids, log);
-  await gcStaleCache(config.dbPath, undefined, undefined, log);
+  // Fire-and-forget: cache write + GC are best-effort side effects for the
+  // out-of-process MCP server. Awaiting them blocks agent.run.started on
+  // ~3 readdirs + N stats with no benefit to the in-process recall path
+  // (ctx.state above is the authoritative read inside Paperclip). Failures
+  // are logged via writeRecallCache/gcStaleCache's own try/catch handlers,
+  // and the .catch() here mops up anything they re-throw.
+  void writeRecallCache(config.dbPath, state, ids, log).catch((error: unknown) =>
+    log(`[holographic-memory] writeRecallCache rejected: ${(error as Error).message}`),
+  );
+  void gcStaleCache(config.dbPath, undefined, undefined, log).catch((error: unknown) =>
+    log(`[holographic-memory] gcStaleCache rejected: ${(error as Error).message}`),
+  );
 
   return state;
 }
@@ -218,7 +234,7 @@ async function handleRecallContext(
   // ctx.state above; this branch covers the case where ctx.state was never
   // populated (e.g. plugin restart between agent.run.started and the tool
   // call) and serves the same source of truth the standalone MCP server reads.
-  const fileLookups: Array<["run" | "issue" | "agent", string]> = [];
+  const fileLookups: Array<[RecallCacheScope, string]> = [];
   if (params.run_id) fileLookups.push(["run", params.run_id]);
   if (params.issue_id) fileLookups.push(["issue", params.issue_id]);
   if (params.agent_id) fileLookups.push(["agent", params.agent_id]);
@@ -293,50 +309,12 @@ export async function dispatchAction(
 }
 
 function registerSearchTool(ctx: any, config: HolographicMemoryConfig): void {
-  const description = buildToolDescription();
-
   const declaration = {
     displayName: "Holographic Memory",
-    description,
-    parametersSchema: {
-      type: "object",
-      properties: {
-        action: {
-          type: "string",
-          enum: [
-            "search",
-            "probe",
-            "related",
-            "reason",
-            "recall_context",
-            "list",
-            "feedback",
-            "add",
-            "update",
-            "remove"
-          ],
-          default: "search"
-        },
-        query: { type: "string" },
-        entity: { type: "string" },
-        entities: { type: "array", items: { type: "string" } },
-        category: { type: "string" },
-        fact_id: { type: "number" },
-        helpful: { type: "boolean" },
-        limit: { type: "number", default: 5, minimum: 1, maximum: 50 },
-        min_trust: { type: "number", default: config.minTrustScore, minimum: 0, maximum: 1 },
-        run_id: { type: "string" },
-        issue_id: { type: "string" },
-        agent_id: { type: "string" },
-        content: { type: "string" },
-        tags: {
-          oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }]
-        },
-        trust_score: { type: "number", minimum: 0, maximum: 1 },
-        trust_delta: { type: "number", minimum: -1, maximum: 1 }
-      },
-      required: []
-    }
+    description: HOLO_MEMORY_TOOL_DESCRIPTION,
+    // Derived from the same zod source the manifest and the standalone MCP
+    // server use, so all three entry points see identical parameter shapes.
+    parametersSchema: toJsonSchema(),
   };
 
   const handler = async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
@@ -350,22 +328,11 @@ function registerSearchTool(ctx: any, config: HolographicMemoryConfig): void {
   }
 }
 
-// Returns the static system-prompt surrogate for the tool description.
-// Tool declarations are registered once at setup() and not refreshed,
-// so we deliberately avoid embedding mutable state (e.g. fact counts)
-// here — stale info would mislead the agent. Status belongs in the
-// data returned by recall_context / list, not in the schema's description.
+// Re-export the tool description constant under the legacy function name so
+// existing test imports keep working. The description body lives in
+// src/tool-schema.ts as the single source of truth.
 export function buildToolDescription(): string {
-  return [
-    "Holographic memory store. Facts persist across runs in an isolated SQLite DB.",
-    "",
-    "On the first turn of a run, call action='recall_context' to read any pre-fetched memory for the current issue.",
-    "Use action='search', 'probe', or 'reason' to retrieve facts. Pass min_trust to filter weak facts.",
-    "Use action='add' to store a durable fact the user would expect remembered. Mark category ('project','user_pref','tool','general') and tags.",
-    "Use action='feedback' (helpful: boolean) on a fact_id after consuming it — this trains trust scores so good facts rise.",
-    "Use action='update' to refine a fact's content or trust; action='remove' to delete a stale fact.",
-    "Note: writes (add/update/remove) require retainEnabled=true in plugin config."
-  ].join("\n");
+  return HOLO_MEMORY_TOOL_DESCRIPTION;
 }
 
 function registerSettings(ctx: any, config: HolographicMemoryConfig): void {
