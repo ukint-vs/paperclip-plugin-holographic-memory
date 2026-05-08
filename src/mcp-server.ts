@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { DEFAULT_DB_PATH, expandHome } from "./config.js";
@@ -144,11 +145,12 @@ const invokedAsScript = (() => {
   const argv1 = process.argv[1];
   if (!argv1) return false;
   // tsx and node both populate argv[1] with the resolved path of the script;
-  // in production this is dist/mcp-server.js. We compare against import.meta.url
-  // when available for ESM-aware detection.
+  // in production this is dist/mcp-server.js. fileURLToPath gives a real
+  // platform path (handles Windows drive prefixes and URL-encoded spaces);
+  // a raw URL.pathname compare would mismatch on those.
   try {
-    const url = new URL(import.meta.url);
-    return url.pathname === argv1 || url.pathname.endsWith("/mcp-server.js");
+    const filename = fileURLToPath(import.meta.url);
+    return filename === argv1 || /mcp-server\.(js|ts)$/.test(filename);
   } catch {
     return /mcp-server\.(js|ts)$/.test(argv1);
   }

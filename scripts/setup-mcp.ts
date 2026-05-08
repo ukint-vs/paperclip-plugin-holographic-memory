@@ -2,6 +2,7 @@
 import fs from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import TOML from "@iarna/toml";
 import { atomicWrite } from "../src/atomic-write.js";
 
@@ -395,9 +396,11 @@ Options:
 }
 
 const invokedAsScript = (() => {
+  // fileURLToPath gives a real platform path (handles Windows drive prefixes
+  // and URL-encoded spaces); a raw URL.pathname compare would mismatch on those.
   try {
-    const url = new URL(import.meta.url);
-    return process.argv[1] === url.pathname || /setup-mcp\.(ts|js)$/.test(process.argv[1] ?? "");
+    const filename = fileURLToPath(import.meta.url);
+    return process.argv[1] === filename || /setup-mcp\.(ts|js)$/.test(process.argv[1] ?? "");
   } catch {
     return /setup-mcp\.(ts|js)$/.test(process.argv[1] ?? "");
   }
