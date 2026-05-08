@@ -411,11 +411,8 @@ describe("extractRunStartedFields", () => {
 });
 
 describe("buildToolDescription", () => {
-  it("includes the fact count and the four required usage cues", () => {
-    const description = buildToolDescription(42);
-
-    // Fact-count line acts as the system-prompt surrogate's status block.
-    expect(description).toContain("42 facts available");
+  it("contains the four required usage cues", () => {
+    const description = buildToolDescription();
 
     // Hermes-style usage instructions the agent prompt depends on.
     expect(description).toMatch(/recall_context/);
@@ -424,24 +421,28 @@ describe("buildToolDescription", () => {
     expect(description).toMatch(/retainEnabled/);
   });
 
-  it("renders zero-fact state without breaking the fact-count line", () => {
-    const description = buildToolDescription(0);
-    expect(description).toContain("0 facts available");
+  it("is deterministic — no mutable state baked in (tool description is registered once)", () => {
+    const a = buildToolDescription();
+    const b = buildToolDescription();
+    expect(a).toBe(b);
+    // Defensive check: must not embed any digits — those would be staleness-prone counts.
+    // (A single number anywhere in the description would imply we're back to caching state.)
+    expect(/\d/.test(a)).toBe(false);
   });
 
   it("returns multi-line text (no host-side trimming risk on a single blob)", () => {
-    const description = buildToolDescription(1);
+    const description = buildToolDescription();
     expect(description.split("\n").length).toBeGreaterThan(3);
   });
 });
 
-describe("dispatchAction — singleton store reuse", () => {
-  it("does not reopen the database for each tool call", async () => {
+describe("dispatchAction — store registry", () => {
+  it("reuses the same store across calls with the same dbPath", async () => {
     const dbPath = createDb();
     const { ctx } = fakeStateCtx();
     const config = baseConfig(dbPath);
 
-    // Two calls in a row; if the singleton works the second is just a reuse.
+    // Two calls in a row; the registry should return the same MemoryStore instance.
     await dispatchAction({ action: "search", query: "first", min_trust: 0 }, config, ctx, FAKE_RUN_CTX);
     const second = await dispatchAction(
       { action: "list", min_trust: 0 },
@@ -456,6 +457,38 @@ describe("dispatchAction — singleton store reuse", () => {
     // The DB file should still be a single SQLite file (no shadow copies).
     const direct = new MemoryStore(dbPath);
     direct.close();
+  });
+
+  it("isolates by dbPath — distinct paths get distinct stores", async () => {
+    const dbA = createDb();
+    const dbB = createDb();
+    const { ctx } = fakeStateCtx();
+
+    // Add a fact via A's path.
+    await dispatchAction(
+      { action: "add", content: "only-in-A" },
+      baseConfig(dbA),
+      ctx,
+      FAKE_RUN_CTX
+    );
+
+    // Search via B's path — must NOT see A's fact.
+    const inB = await dispatchAction(
+      { action: "search", query: "only-in-A", min_trust: 0 },
+      baseConfig(dbB),
+      ctx,
+      FAKE_RUN_CTX
+    );
+    expect(inB.content).not.toContain("only-in-A");
+
+    // Search via A's path again — must still see it (registry cached the open connection).
+    const inA = await dispatchAction(
+      { action: "search", query: "only-in-A", min_trust: 0 },
+      baseConfig(dbA),
+      ctx,
+      FAKE_RUN_CTX
+    );
+    expect(inA.content).toContain("only-in-A");
   });
 });
 

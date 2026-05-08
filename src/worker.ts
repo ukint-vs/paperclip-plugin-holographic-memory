@@ -36,20 +36,26 @@ interface ToolParams {
   trust_delta?: number;
 }
 
-// Singleton MemoryStore: opened once on first use, closed in onShutdown.
-// Avoids repeated PRAGMA reads + schema-existence checks on every tool call.
-let storeSingleton: MemoryStore | undefined;
+// MemoryStore registry keyed by dbPath. The plugin is intentionally
+// instance-scoped (one DB per Paperclip instance, per the README and
+// Hermes parity), but keying by path lets onConfigChanged swap the
+// path at runtime without leaking a stale connection. Closed in onShutdown.
+const storeRegistry = new Map<string, MemoryStore>();
 
 function getStore(config: HolographicMemoryConfig): MemoryStore {
-  if (!storeSingleton) {
-    storeSingleton = new MemoryStore(config.dbPath);
+  let store = storeRegistry.get(config.dbPath);
+  if (!store) {
+    store = new MemoryStore(config.dbPath);
+    storeRegistry.set(config.dbPath, store);
   }
-  return storeSingleton;
+  return store;
 }
 
-function closeStore(): void {
-  storeSingleton?.close();
-  storeSingleton = undefined;
+function closeStores(): void {
+  for (const store of storeRegistry.values()) {
+    store.close();
+  }
+  storeRegistry.clear();
 }
 
 export default definePlugin({
@@ -65,7 +71,7 @@ export default definePlugin({
     });
   },
   async onShutdown() {
-    closeStore();
+    closeStores();
   }
 });
 
@@ -346,8 +352,7 @@ export async function dispatchAction(
 }
 
 function registerSearchTool(ctx: any, config: HolographicMemoryConfig): void {
-  const factCount = readFactCount(config);
-  const description = buildToolDescription(factCount);
+  const description = buildToolDescription();
 
   const declaration = {
     displayName: "Holographic Memory",
@@ -404,18 +409,14 @@ function registerSearchTool(ctx: any, config: HolographicMemoryConfig): void {
   }
 }
 
-function readFactCount(config: HolographicMemoryConfig): number {
-  try {
-    const store = getStore(config);
-    return store.countFacts();
-  } catch {
-    return 0;
-  }
-}
-
-export function buildToolDescription(factCount: number): string {
+// Returns the static system-prompt surrogate for the tool description.
+// Tool declarations are registered once at setup() and not refreshed,
+// so we deliberately avoid embedding mutable state (e.g. fact counts)
+// here — stale info would mislead the agent. Status belongs in the
+// data returned by recall_context / list, not in the schema's description.
+export function buildToolDescription(): string {
   return [
-    `Holographic memory store. ${factCount} facts available.`,
+    "Holographic memory store. Facts persist across runs in an isolated SQLite DB.",
     "",
     "On the first turn of a run, call action='recall_context' to read any pre-fetched memory for the current issue.",
     "Use action='search', 'probe', or 'reason' to retrieve facts. Pass min_trust to filter weak facts.",
