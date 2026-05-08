@@ -34,6 +34,22 @@ export interface AddFactResult {
   inserted: boolean;
 }
 
+export interface UpdateFactPartial {
+  content?: string;
+  category?: string;
+  tags?: string | string[];
+  trustDelta?: number;
+}
+
+export interface UpdateFactResult {
+  updated: boolean;
+  reason?: "not_found" | "duplicate_content";
+}
+
+export interface RemoveFactResult {
+  removed: boolean;
+}
+
 export interface FactFeedbackResult {
   factId: number;
   oldTrust: number;

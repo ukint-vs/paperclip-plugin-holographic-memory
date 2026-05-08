@@ -2,7 +2,16 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { bundle, bytesToPhases, DEFAULT_HRR_DIM, encodeAtom, encodeFact, encodeText, phasesToBytes, similarity, unbind } from "./hrr.js";
-import type { AddFactResult, FactFeedbackResult, MemoryFact, MemorySearchOptions, NewMemoryFact } from "./types.js";
+import type {
+  AddFactResult,
+  FactFeedbackResult,
+  MemoryFact,
+  MemorySearchOptions,
+  NewMemoryFact,
+  RemoveFactResult,
+  UpdateFactPartial,
+  UpdateFactResult
+} from "./types.js";
 
 interface FactRow {
   fact_id: number;
@@ -78,31 +87,130 @@ export class MemoryStore {
       throw new Error("Cannot add an empty memory fact");
     }
 
-    const existing = this.db.prepare("SELECT fact_id FROM facts WHERE content = ?").get(content) as
-      | { fact_id: number }
-      | undefined;
     const tags = normalizeTags(fact.tags);
     const category = fact.category?.trim() || "general";
     const trustScore = normalizeTrust(fact.trustScore);
 
-    if (existing) {
-      return { factId: existing.fact_id, inserted: false };
-    }
+    const run = this.db.transaction((): AddFactResult => {
+      const existing = this.db.prepare("SELECT fact_id FROM facts WHERE content = ?").get(content) as
+        | { fact_id: number }
+        | undefined;
 
-    const result = this.db
-      .prepare("INSERT INTO facts (content, category, tags, trust_score) VALUES (?, ?, ?, ?)")
-      .run(content, category, tags, trustScore);
-    const factId = Number(result.lastInsertRowid);
-    const entities = extractEntities(content);
+      if (existing) {
+        return { factId: existing.fact_id, inserted: false };
+      }
 
-    for (const entity of entities) {
-      const entityId = this.resolveEntity(entity);
-      this.linkFactEntity(factId, entityId);
-    }
+      const result = this.db
+        .prepare("INSERT INTO facts (content, category, tags, trust_score) VALUES (?, ?, ?, ?)")
+        .run(content, category, tags, trustScore);
+      const factId = Number(result.lastInsertRowid);
+      const entities = extractEntities(content);
 
-    this.computeHrrVector(factId, content, entities);
-    this.rebuildBank(category);
-    return { factId, inserted: true };
+      for (const entity of entities) {
+        const entityId = this.resolveEntity(entity);
+        this.linkFactEntity(factId, entityId);
+      }
+
+      this.computeHrrVector(factId, content, entities);
+      this.rebuildBank(category);
+      return { factId, inserted: true };
+    });
+
+    return run();
+  }
+
+  updateFact(factId: number, partial: UpdateFactPartial): UpdateFactResult {
+    const run = this.db.transaction((): UpdateFactResult => {
+      const row = this.db
+        .prepare("SELECT fact_id, category, trust_score FROM facts WHERE fact_id = ?")
+        .get(factId) as { fact_id: number; category: string; trust_score: number } | undefined;
+
+      if (!row) {
+        return { updated: false, reason: "not_found" };
+      }
+
+      const oldCategory = row.category ?? "general";
+      const newContent = typeof partial.content === "string" ? partial.content.trim() : undefined;
+      const contentChanged = newContent !== undefined && newContent.length > 0;
+      const newCategory = partial.category?.trim();
+      const categoryChanged = typeof newCategory === "string" && newCategory.length > 0 && newCategory !== oldCategory;
+      const newTags = partial.tags === undefined ? undefined : normalizeTags(partial.tags);
+      const newTrust =
+        typeof partial.trustDelta === "number" && !Number.isNaN(partial.trustDelta)
+          ? normalizeTrust(row.trust_score + partial.trustDelta)
+          : undefined;
+
+      const sets: string[] = ["updated_at = CURRENT_TIMESTAMP"];
+      const params: unknown[] = [];
+
+      if (contentChanged) {
+        sets.push("content = ?");
+        params.push(newContent!);
+      }
+      if (categoryChanged) {
+        sets.push("category = ?");
+        params.push(newCategory!);
+      }
+      if (newTags !== undefined) {
+        sets.push("tags = ?");
+        params.push(newTags);
+      }
+      if (newTrust !== undefined) {
+        sets.push("trust_score = ?");
+        params.push(newTrust);
+      }
+
+      params.push(factId);
+
+      try {
+        this.db.prepare(`UPDATE facts SET ${sets.join(", ")} WHERE fact_id = ?`).run(...params);
+      } catch (error) {
+        if (isUniqueConstraintError(error)) {
+          return { updated: false, reason: "duplicate_content" };
+        }
+        throw error;
+      }
+
+      const finalCategory = categoryChanged ? newCategory! : oldCategory;
+
+      if (contentChanged) {
+        this.db.prepare("DELETE FROM fact_entities WHERE fact_id = ?").run(factId);
+        const entities = extractEntities(newContent!);
+        for (const entity of entities) {
+          const entityId = this.resolveEntity(entity);
+          this.linkFactEntity(factId, entityId);
+        }
+        this.computeHrrVector(factId, newContent!, entities);
+      }
+
+      if (contentChanged || categoryChanged) {
+        if (categoryChanged) this.rebuildBank(oldCategory);
+        this.rebuildBank(finalCategory);
+      }
+
+      return { updated: true };
+    });
+
+    return run();
+  }
+
+  removeFact(factId: number): RemoveFactResult {
+    const run = this.db.transaction((): RemoveFactResult => {
+      const row = this.db.prepare("SELECT fact_id, category FROM facts WHERE fact_id = ?").get(factId) as
+        | { fact_id: number; category: string }
+        | undefined;
+
+      if (!row) {
+        return { removed: false };
+      }
+
+      this.db.prepare("DELETE FROM fact_entities WHERE fact_id = ?").run(factId);
+      this.db.prepare("DELETE FROM facts WHERE fact_id = ?").run(factId);
+      this.rebuildBank(row.category ?? "general");
+      return { removed: true };
+    });
+
+    return run();
   }
 
   probe(entity: string, options: MemorySearchOptions = {}): MemoryFact[] {
@@ -442,6 +550,12 @@ function normalizeTrust(value: number | undefined): number {
   }
 
   return Math.max(0, Math.min(1, value));
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as { code?: string }).code;
+  return code === "SQLITE_CONSTRAINT_UNIQUE" || code === "SQLITE_CONSTRAINT";
 }
 
 function normalizeTags(tags: string | string[] | undefined): string {
