@@ -5,23 +5,34 @@
   "type": "module",
   "main": "dist/worker.js",
   "types": "dist/worker.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/worker.js",
+      "types": "./dist/worker.d.ts"
+    },
+    "./manifest": {
+      "import": "./dist/manifest.js",
+      "types": "./dist/manifest.d.ts"
+    },
+    "./package.json": "./package.json"
+  },
   "paperclipPlugin": {
     "manifest": "./dist/manifest.js",
     "worker": "./dist/worker.js"
   },
   "files": [
     "dist",
-    "src",
     "scripts",
-    "README.md",
-    "package.json"
+    "LICENSE",
+    "README.md"
   ],
   "scripts": {
     "build": "tsup src/worker.ts src/manifest.ts src/ui/index.tsx --format esm --dts --clean",
     "seed:paperclip": "tsx scripts/seed-from-paperclip.ts",
     "import:facts": "tsx scripts/import-facts.ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepublishOnly": "pnpm typecheck && pnpm test && pnpm build"
   },
   "keywords": [
     "paperclip",
@@ -30,7 +41,19 @@
     "holographic",
     "hermes"
   ],
+  "author": "Vadim Smirnov <ukint-vs@proton.me>",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ukint-vs/paperclip-plugin-holographic-memory.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ukint-vs/paperclip-plugin-holographic-memory/issues"
+  },
+  "homepage": "https://github.com/ukint-vs/paperclip-plugin-holographic-memory#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@paperclipai/plugin-sdk": "latest",
     "better-sqlite3": "^11.10.0",
