@@ -3,7 +3,32 @@ import type { ScopeKey, ToolResult, ToolRunContext } from "@paperclipai/plugin-s
 import { extractFactsFromText } from "./auto-extract.js";
 import { formatFactsAsText, formatFactsForPrompt } from "./context-injector.js";
 import { resolvePluginConfig } from "./config.js";
-import { MemoryStore } from "./memory-store.js";
+import {
+  gcStaleCache,
+  readRecallCache,
+  writeRecallCache,
+  type RecallCacheScope,
+} from "./recall-cache.js";
+import { HOLO_MEMORY_TOOL_DESCRIPTION, toJsonSchema } from "./tool-schema.js";
+import {
+  READ_ACTIONS,
+  WRITE_ACTIONS,
+  closeStores,
+  err,
+  getStore,
+  handleAdd,
+  handleFeedback,
+  handleList,
+  handleProbe,
+  handleRelated,
+  handleReason,
+  handleRemove,
+  handleSearch,
+  handleUpdate,
+  type CoreActionHandler,
+  type ToolParams
+} from "./dispatch.js";
+import type { MemoryStore } from "./memory-store.js";
 import type { AgentRunEvent, HolographicMemoryConfig, RecallState } from "./types.js";
 
 const STATE_NAMESPACE = "recall";
@@ -26,50 +51,9 @@ const STATE_KEY = "context";
 const AUTO_EXTRACT_TRUST = 0.3;
 const AUTO_EXTRACT_SOURCE = "auto";
 
-interface ToolParams {
-  action?: string;
-  // Read params
-  query?: string;
-  entity?: string;
-  entities?: string[];
-  category?: string;
-  fact_id?: number;
-  helpful?: boolean;
-  limit?: number;
-  min_trust?: number;
-  // Recall params
-  run_id?: string;
-  issue_id?: string;
-  agent_id?: string;
-  // Write params
-  content?: string;
-  tags?: string | string[];
-  trust_score?: number;
-  trust_delta?: number;
-}
-
-// MemoryStore registry keyed by dbPath. The plugin is intentionally
-// instance-scoped (one DB per Paperclip instance, per the README and
-// Hermes parity), but keying by path lets onConfigChanged swap the
-// path at runtime without leaking a stale connection. Closed in onShutdown.
-const storeRegistry = new Map<string, MemoryStore>();
-
-function getStore(config: HolographicMemoryConfig): MemoryStore {
-  let store = storeRegistry.get(config.dbPath);
-  if (!store) {
-    store = new MemoryStore(config.dbPath);
-    storeRegistry.set(config.dbPath, store);
-  }
-  return store;
-}
-
-function closeStores(): void {
-  for (const store of storeRegistry.values()) {
-    store.close();
-  }
-  storeRegistry.clear();
-}
-
+// joinIssueText is shared by handleRunStarted (recall query) and
+// handleRunFinished (auto-extract source text). storeRegistry / getStore /
+// closeStores live in dispatch.ts so the standalone MCP server reuses them.
 function joinIssueText(issue: any): string {
   return [issue?.title, issue?.description, issue?.body]
     .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
@@ -83,6 +67,14 @@ const plugin = definePlugin({
     registerSettings(ctx, config);
     registerSearchTool(ctx, config);
 
+    // Recall is wired only via in-process Paperclip RPC here. To make the
+    // tool reachable from claude_local / codex_local subprocesses (which
+    // don't see ctx.tools.register), we ship a separate stdio MCP server in
+    // src/mcp-server.ts plus a setup script that registers it in the user's
+    // Claude/Codex MCP config. Do NOT auto-write per-run MCP config from
+    // this worker — Paperclip's claude-local seed dir is content-hashed
+    // (see paperclip claude-config.ts:40-50) and a per-run write would
+    // invalidate the seed cache and race concurrent agents. See issue #20.
     ctx.events?.on?.("agent.run.started", async (event: any) => {
       const payload = extractRunFields(event);
       await handleRunStarted(ctx, payload, config);
@@ -264,6 +256,38 @@ export async function handleRunStarted(
     elapsedMs: elapsed()
   });
 
+  // Mirror to the on-disk recall cache so the standalone MCP server (claude_local
+  // / codex_local subprocesses) can resolve recall_context across processes.
+  // Best-effort: write failures are logged, never thrown — agent runs must
+  // not break because the cache is unhappy. GC stale entries in the same pass.
+  const log = (m: string) => ctx.log?.warn?.(m) ?? ctx.logger?.warn?.(m) ?? undefined;
+  // exactOptionalPropertyTypes requires we omit undefined properties rather
+  // than assigning `undefined` to optional fields.
+  const ids: { runId?: string; issueId?: string; agentId?: string } = {};
+  if (event.runId) ids.runId = event.runId;
+  if (event.issueId) ids.issueId = event.issueId;
+  if (event.agentId) ids.agentId = event.agentId;
+  // Fire-and-forget: cache write + GC are best-effort side effects for the
+  // out-of-process MCP server. Awaiting them blocks agent.run.started on
+  // ~3 readdirs + N stats with no benefit to the in-process recall path
+  // (ctx.state above is the authoritative read inside Paperclip). Failures
+  // are logged via writeRecallCache/gcStaleCache's own try/catch handlers.
+  // The Promise.resolve().then() wrapper catches synchronous throws (e.g.
+  // a future schema change makes RecallState non-serializable, JSON.stringify
+  // throws inside writeRecallCache before any Promise is returned). Without
+  // it, `.catch()` would never see the error because it'd surface as a sync
+  // throw on the worker's call stack, killing agent.run.started silently.
+  void Promise.resolve()
+    .then(() => writeRecallCache(config.dbPath, state, ids, log))
+    .catch((error: unknown) =>
+      log(`[holographic-memory] writeRecallCache rejected: ${(error as Error).message}`),
+    );
+  void Promise.resolve()
+    .then(() => gcStaleCache(config.dbPath, undefined, undefined, log))
+    .catch((error: unknown) =>
+      log(`[holographic-memory] gcStaleCache rejected: ${(error as Error).message}`),
+    );
+
   return state;
 }
 
@@ -404,110 +428,18 @@ async function readScopeState(ctx: any, scope: ScopeKey): Promise<RecallState | 
 }
 
 // ---------------------------------------------------------------------------
-// Action handlers — exported for direct invocation in tests.
+// recall_context — only ctx-aware handler; lives here because it reads
+// plugin state populated on agent.run.started. Other handlers are in
+// dispatch.ts so the standalone MCP server can reuse them.
 // ---------------------------------------------------------------------------
 
-type ActionHandler = (
+type CtxActionHandler = (
   store: MemoryStore,
   params: ToolParams,
   config: HolographicMemoryConfig,
   ctx: any,
   runCtx: ToolRunContext
 ) => Promise<ToolResult>;
-
-function err(message: string): ToolResult {
-  return { content: message, error: message };
-}
-
-// Build the read-side options shared by every search-style handler.
-// Cross-tenant scoping piggybacks on this: every read path scopes to
-// the caller's company (plus NULL = global), so two companies sharing a
-// dbPath cannot see each other's facts.
-function readOptions(
-  params: ToolParams,
-  config: HolographicMemoryConfig,
-  runCtx: ToolRunContext
-): { limit: number; minTrust: number; companyId?: string } {
-  const opts: { limit: number; minTrust: number; companyId?: string } = {
-    limit: params.limit ?? 5,
-    minTrust: params.min_trust ?? config.minTrustScore
-  };
-  if (runCtx?.companyId) opts.companyId = runCtx.companyId;
-  return opts;
-}
-
-async function handleSearch(
-  store: MemoryStore,
-  params: ToolParams,
-  config: HolographicMemoryConfig,
-  _ctx: any,
-  runCtx: ToolRunContext
-): Promise<ToolResult> {
-  if (!params.query?.trim()) return err("Missing required parameter: query");
-  const facts = store.search(params.query, readOptions(params, config, runCtx));
-  return { content: formatFactsAsText(facts) };
-}
-
-async function handleProbe(
-  store: MemoryStore,
-  params: ToolParams,
-  config: HolographicMemoryConfig,
-  _ctx: any,
-  runCtx: ToolRunContext
-): Promise<ToolResult> {
-  if (!params.entity?.trim()) return err("Missing required parameter: entity");
-  const facts = store.probe(params.entity, readOptions(params, config, runCtx));
-  return { content: formatFactsAsText(facts) };
-}
-
-async function handleRelated(
-  store: MemoryStore,
-  params: ToolParams,
-  config: HolographicMemoryConfig,
-  _ctx: any,
-  runCtx: ToolRunContext
-): Promise<ToolResult> {
-  if (!params.entity?.trim()) return err("Missing required parameter: entity");
-  const facts = store.related(params.entity, readOptions(params, config, runCtx));
-  return { content: formatFactsAsText(facts) };
-}
-
-async function handleReason(
-  store: MemoryStore,
-  params: ToolParams,
-  config: HolographicMemoryConfig,
-  _ctx: any,
-  runCtx: ToolRunContext
-): Promise<ToolResult> {
-  if (!Array.isArray(params.entities) || params.entities.length === 0) {
-    return err("Missing required parameter: entities");
-  }
-  const facts = store.reason(params.entities, readOptions(params, config, runCtx));
-  return { content: formatFactsAsText(facts) };
-}
-
-async function handleList(
-  store: MemoryStore,
-  params: ToolParams,
-  config: HolographicMemoryConfig,
-  _ctx: any,
-  runCtx: ToolRunContext
-): Promise<ToolResult> {
-  const base = readOptions(params, config, runCtx);
-  const options: { limit: number; minTrust: number; category?: string; companyId?: string } = { ...base };
-  if (params.category) options.category = params.category;
-  const facts = store.listFacts(options);
-  // D6 / Codex C10: list is a CRUD/inventory op, returns JSON.
-  return { content: JSON.stringify({ facts, count: facts.length }), data: { facts, count: facts.length } };
-}
-
-async function handleFeedback(store: MemoryStore, params: ToolParams): Promise<ToolResult> {
-  if (typeof params.fact_id !== "number" || typeof params.helpful !== "boolean") {
-    return err("Missing required parameters: fact_id and helpful");
-  }
-  const result = store.recordFeedback(params.fact_id, params.helpful);
-  return { content: JSON.stringify(result), data: result };
-}
 
 async function handleRecallContext(
   store: MemoryStore,
@@ -534,12 +466,32 @@ async function handleRecallContext(
     }
   }
 
+  // Fall back to the on-disk recall cache. In-Paperclip we usually hit
+  // ctx.state above; this branch covers the case where ctx.state was never
+  // populated (e.g. plugin restart between agent.run.started and the tool
+  // call) and serves the same source of truth the standalone MCP server reads.
+  const fileLookups: Array<[RecallCacheScope, string]> = [];
+  if (params.run_id) fileLookups.push(["run", params.run_id]);
+  if (params.issue_id) fileLookups.push(["issue", params.issue_id]);
+  if (params.agent_id) fileLookups.push(["agent", params.agent_id]);
+  if (runCtx?.runId) fileLookups.push(["run", runCtx.runId]);
+  if (runCtx?.agentId) fileLookups.push(["agent", runCtx.agentId]);
+  for (const [scope, scopeId] of fileLookups) {
+    const cached = await readRecallCache(config.dbPath, scope, scopeId);
+    if (cached?.formatted) {
+      return { content: cached.formatted, data: cached };
+    }
+  }
+
   if (params.query?.trim()) {
-    // recall_context's live-search fallback uses maxFactsPerRecall (not
-    // the read-handler default of 5) so the cached-vs-search split
-    // behaves consistently. readOptions() handles companyId pass-through.
-    const opts = readOptions(params, config, runCtx);
-    opts.limit = params.limit ?? config.maxFactsPerRecall;
+    // recall_context's live-search fallback uses maxFactsPerRecall (not the
+    // dispatch read-handler default of 5) so the cached-vs-search split
+    // behaves consistently. companyId scoping mirrors the dispatch path.
+    const opts: { limit: number; minTrust: number; companyId?: string } = {
+      limit: params.limit ?? config.maxFactsPerRecall,
+      minTrust: params.min_trust ?? config.minTrustScore
+    };
+    if (runCtx?.companyId) opts.companyId = runCtx.companyId;
     const facts = store.search(params.query, opts);
     return { content: formatFactsAsText(facts) };
   }
@@ -550,61 +502,32 @@ async function handleRecallContext(
   };
 }
 
-async function handleAdd(
-  store: MemoryStore,
-  params: ToolParams,
-  _config: HolographicMemoryConfig,
-  _ctx: any,
-  runCtx: ToolRunContext
-): Promise<ToolResult> {
-  if (typeof params.content !== "string" || !params.content.trim()) {
-    return err("Missing required parameter: content");
-  }
-  const fact: Parameters<MemoryStore["addFact"]>[0] = { content: params.content };
-  if (typeof params.category === "string") fact.category = params.category;
-  if (params.tags !== undefined) fact.tags = params.tags;
-  if (typeof params.trust_score === "number") fact.trustScore = params.trust_score;
-  if (runCtx?.companyId) fact.companyId = runCtx.companyId;
-  const result = store.addFact(fact);
-  return { content: JSON.stringify(result), data: result };
+// Adapter that bridges a CoreActionHandler (which returns a DispatchToolResult)
+// into the ctx-aware ActionHandler shape expected by the worker dispatch.
+// Forwards `runCtx` so cross-tenant scoping (companyId) reaches the core
+// handlers — the standalone MCP server passes runCtx: undefined.
+function adaptCore(handler: CoreActionHandler): CtxActionHandler {
+  return async (store, params, config, _ctx, runCtx) => {
+    const result = await handler(store, params, config, runCtx);
+    // DispatchToolResult and ToolResult are structurally identical for our
+    // purposes (content + optional data + optional error). The cast keeps
+    // the SDK type contract without re-allocating.
+    return result as ToolResult;
+  };
 }
 
-async function handleUpdate(store: MemoryStore, params: ToolParams): Promise<ToolResult> {
-  if (typeof params.fact_id !== "number") {
-    return err("Missing required parameter: fact_id");
-  }
-  const partial: Parameters<MemoryStore["updateFact"]>[1] = {};
-  if (typeof params.content === "string") partial.content = params.content;
-  if (typeof params.category === "string") partial.category = params.category;
-  if (params.tags !== undefined) partial.tags = params.tags;
-  if (typeof params.trust_delta === "number") partial.trustDelta = params.trust_delta;
-  const result = store.updateFact(params.fact_id, partial);
-  return { content: JSON.stringify(result), data: result };
-}
-
-async function handleRemove(store: MemoryStore, params: ToolParams): Promise<ToolResult> {
-  if (typeof params.fact_id !== "number") {
-    return err("Missing required parameter: fact_id");
-  }
-  const result = store.removeFact(params.fact_id);
-  return { content: JSON.stringify(result), data: result };
-}
-
-export const ACTION_HANDLERS: Record<string, ActionHandler> = {
-  search: handleSearch,
-  probe: handleProbe,
-  related: handleRelated,
-  reason: handleReason,
+export const ACTION_HANDLERS: Record<string, CtxActionHandler> = {
+  search: adaptCore(handleSearch),
+  probe: adaptCore(handleProbe),
+  related: adaptCore(handleRelated),
+  reason: adaptCore(handleReason),
   recall_context: handleRecallContext,
-  list: handleList,
-  feedback: handleFeedback,
-  add: handleAdd,
-  update: handleUpdate,
-  remove: handleRemove
+  list: adaptCore(handleList),
+  feedback: adaptCore(handleFeedback),
+  add: adaptCore(handleAdd),
+  update: adaptCore(handleUpdate),
+  remove: adaptCore(handleRemove)
 };
-
-const READ_ACTIONS = new Set(["search", "probe", "related", "reason", "recall_context", "list", "feedback"]);
-const WRITE_ACTIONS = new Set(["add", "update", "remove"]);
 
 export async function dispatchAction(
   params: ToolParams,
@@ -614,7 +537,7 @@ export async function dispatchAction(
 ): Promise<ToolResult> {
   const action = params.action ?? "search";
   const handler = ACTION_HANDLERS[action];
-  if (!handler) return err(`Unknown memory action: ${action}`);
+  if (!handler) return err(`Unknown memory action: ${action}`) as ToolResult;
 
   if (READ_ACTIONS.has(action) && !config.recallEnabled) {
     return { content: "Holographic memory recall is disabled." };
@@ -629,50 +552,12 @@ export async function dispatchAction(
 }
 
 function registerSearchTool(ctx: any, config: HolographicMemoryConfig): void {
-  const description = buildToolDescription();
-
   const declaration = {
     displayName: "Holographic Memory",
-    description,
-    parametersSchema: {
-      type: "object",
-      properties: {
-        action: {
-          type: "string",
-          enum: [
-            "search",
-            "probe",
-            "related",
-            "reason",
-            "recall_context",
-            "list",
-            "feedback",
-            "add",
-            "update",
-            "remove"
-          ],
-          default: "search"
-        },
-        query: { type: "string" },
-        entity: { type: "string" },
-        entities: { type: "array", items: { type: "string" } },
-        category: { type: "string" },
-        fact_id: { type: "number" },
-        helpful: { type: "boolean" },
-        limit: { type: "number", default: 5, minimum: 1, maximum: 50 },
-        min_trust: { type: "number", default: config.minTrustScore, minimum: 0, maximum: 1 },
-        run_id: { type: "string" },
-        issue_id: { type: "string" },
-        agent_id: { type: "string" },
-        content: { type: "string" },
-        tags: {
-          oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }]
-        },
-        trust_score: { type: "number", minimum: 0, maximum: 1 },
-        trust_delta: { type: "number", minimum: -1, maximum: 1 }
-      },
-      required: []
-    }
+    description: HOLO_MEMORY_TOOL_DESCRIPTION,
+    // Derived from the same zod source the manifest and the standalone MCP
+    // server use, so all three entry points see identical parameter shapes.
+    parametersSchema: toJsonSchema(),
   };
 
   const handler = async (params: unknown, runCtx: ToolRunContext): Promise<ToolResult> => {
@@ -686,22 +571,11 @@ function registerSearchTool(ctx: any, config: HolographicMemoryConfig): void {
   }
 }
 
-// Returns the static system-prompt surrogate for the tool description.
-// Tool declarations are registered once at setup() and not refreshed,
-// so we deliberately avoid embedding mutable state (e.g. fact counts)
-// here — stale info would mislead the agent. Status belongs in the
-// data returned by recall_context / list, not in the schema's description.
+// Re-export the tool description constant under the legacy function name so
+// existing test imports keep working. The description body lives in
+// src/tool-schema.ts as the single source of truth.
 export function buildToolDescription(): string {
-  return [
-    "Holographic memory store. Facts persist across runs in an isolated SQLite DB.",
-    "",
-    "On the first turn of a run, call action='recall_context' to read any pre-fetched memory for the current issue.",
-    "Use action='search', 'probe', or 'reason' to retrieve facts. Pass min_trust to filter weak facts.",
-    "Use action='add' to store a durable fact the user would expect remembered. Mark category ('project','user_pref','tool','general') and tags.",
-    "Use action='feedback' (helpful: boolean) on a fact_id after consuming it — this trains trust scores so good facts rise.",
-    "Use action='update' to refine a fact's content or trust; action='remove' to delete a stale fact.",
-    "Note: writes (add/update/remove) require retainEnabled=true in plugin config."
-  ].join("\n");
+  return HOLO_MEMORY_TOOL_DESCRIPTION;
 }
 
 function registerSettings(ctx: any, config: HolographicMemoryConfig): void {

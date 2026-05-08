@@ -55,6 +55,12 @@ export class MemoryStore {
     mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
+    // Multiple processes (worker + per-spawn MCP servers) can hold writers
+    // when the standalone MCP bridge is wired up. With WAL we serialize on
+    // the writer lock; busy_timeout makes contended writes wait up to 5s
+    // for the lock instead of throwing SQLITE_BUSY immediately. Real-world
+    // contention is microseconds; 5s is generous headroom.
+    this.db.pragma("busy_timeout = 5000");
     this.migrate();
   }
 

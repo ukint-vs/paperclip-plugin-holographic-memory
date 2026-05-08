@@ -1,4 +1,5 @@
-import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
+import type { PaperclipPluginManifestV1, PluginToolDeclaration } from "@paperclipai/plugin-sdk";
+import { toJsonSchema } from "./tool-schema.js";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: "paperclip-plugin-holographic-memory",
@@ -67,59 +68,9 @@ const manifest: PaperclipPluginManifestV1 = {
       displayName: "Holographic Memory",
       description:
         "Search and manage an isolated Paperclip holographic memory store. Use this before a task to surface past decisions, entities, and facts; use write actions (gated by retainEnabled) to record durable knowledge.",
-      parametersSchema: {
-        type: "object",
-        properties: {
-          action: {
-            type: "string",
-            enum: [
-              "search",
-              "probe",
-              "related",
-              "reason",
-              "list",
-              "feedback",
-              "recall_context",
-              "add",
-              "update",
-              "remove",
-            ],
-            default: "search",
-            description:
-              "search/probe/related/reason/list/feedback/recall_context are read; add/update/remove require retainEnabled=true.",
-          },
-          query: { type: "string", description: "Free-text query for search/recall_context fallback." },
-          entity: { type: "string", description: "Entity for probe/related." },
-          entities: {
-            type: "array",
-            items: { type: "string" },
-            description: "Entity set for reason action.",
-          },
-          limit: { type: "number", default: 5, minimum: 1, maximum: 50 },
-          min_trust: {
-            type: "number",
-            minimum: 0,
-            maximum: 1,
-            description: "Minimum trust score for this call; overrides the plugin's minTrustScore default.",
-          },
-          run_id: { type: "string" },
-          issue_id: { type: "string" },
-          agent_id: { type: "string" },
-          fact_id: { type: "number" },
-          helpful: { type: "boolean" },
-          content: { type: "string" },
-          category: { type: "string" },
-          tags: {
-            description: "Either a single tag string or an array of tag strings.",
-            oneOf: [
-              { type: "string" },
-              { type: "array", items: { type: "string" } },
-            ],
-          },
-          trust_score: { type: "number", minimum: 0, maximum: 1 },
-          trust_delta: { type: "number", minimum: -1, maximum: 1 },
-        },
-      },
+      // Derived from src/tool-schema.ts so worker / manifest / MCP server can
+      // never disagree on the parameter shape.
+      parametersSchema: toJsonSchema() as PluginToolDeclaration["parametersSchema"],
     },
   ],
 };
