@@ -14,7 +14,14 @@
       "types": "./dist/manifest.d.ts",
       "import": "./dist/manifest.js"
     },
+    "./mcp-server": {
+      "types": "./dist/mcp-server.d.ts",
+      "import": "./dist/mcp-server.js"
+    },
     "./package.json": "./package.json"
+  },
+  "bin": {
+    "paperclip-holographic-memory-mcp": "./dist/mcp-server.js"
   },
   "paperclipPlugin": {
     "manifest": "./dist/manifest.js",
@@ -26,9 +33,10 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsup src/worker.ts src/manifest.ts src/ui/index.tsx --format esm --dts --clean",
+    "build": "tsup",
     "seed:paperclip": "tsx scripts/seed-from-paperclip.ts",
     "import:facts": "tsx scripts/import-facts.ts",
+    "setup:mcp": "tsx scripts/setup-mcp.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "prepublishOnly": "pnpm typecheck && pnpm test && pnpm build"
@@ -38,7 +46,8 @@
     "plugin",
     "memory",
     "holographic",
-    "hermes"
+    "hermes",
+    "mcp"
   ],
   "author": "Vadim Smirnov <ukint-vs@proton.me>",
   "license": "MIT",
@@ -54,9 +63,13 @@
     "access": "public"
   },
   "dependencies": {
+    "@iarna/toml": "^2.2.5",
+    "@modelcontextprotocol/sdk": "^1.18.0",
     "@paperclipai/plugin-sdk": "latest",
     "better-sqlite3": "^11.10.0",
-    "react": "^19.0.0"
+    "react": "^19.0.0",
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.23.5"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
