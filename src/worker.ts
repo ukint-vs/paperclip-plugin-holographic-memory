@@ -1,4 +1,4 @@
-import { definePlugin } from "@paperclipai/plugin-sdk";
+import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 import type { ScopeKey, ToolResult, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { formatFactsAsText, formatFactsForPrompt } from "./context-injector.js";
 import { resolvePluginConfig } from "./config.js";
@@ -59,7 +59,7 @@ function closeStores(): void {
   storeRegistry.clear();
 }
 
-export default definePlugin({
+const plugin = definePlugin({
   async setup(ctx: any) {
     const config = resolvePluginConfig(await readConfig(ctx));
 
@@ -75,6 +75,9 @@ export default definePlugin({
     closeStores();
   }
 });
+
+export default plugin;
+runWorker(plugin, import.meta.url);
 
 export function extractRunStartedFields(event: any): AgentRunStartedEvent {
   // PluginEvent gives us companyId/actorId/entityId at the top level and a
