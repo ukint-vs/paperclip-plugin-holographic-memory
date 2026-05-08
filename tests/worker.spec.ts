@@ -75,6 +75,35 @@ describe("worker", () => {
     expect(state.has("agent:agent-1:recall:context")).toBe(true);
   });
 
+  it("forwards event.companyId to issues.get (PluginEvent envelope, not ctx)", async () => {
+    // Regression: PluginEvent.companyId is required by issues.get. The bug
+    // was reading ctx.companyId (undefined in production) instead, which made
+    // issues.get return null and silently broke automated recall.
+    const dbPath = createDb();
+    const { ctx: stateCtx } = fakeStateCtx();
+    const calls: Array<[string, string | undefined]> = [];
+    const ctx = {
+      ...stateCtx,
+      issues: {
+        get: async (issueId: string, companyId: string) => {
+          calls.push([issueId, companyId]);
+          return { title: "Vara wallet IDL", description: "Need IDL context." };
+        }
+      }
+    };
+
+    const result = await handleRunStarted(
+      ctx,
+      { issueId: "issue-real", runId: "run-real", agentId: "agent-real", companyId: "co-from-event" },
+      baseConfig(dbPath)
+    );
+
+    expect(result?.formatted).toContain("MEMORY CONTEXT:");
+    expect(calls).toEqual([["issue-real", "co-from-event"]]);
+    // ctx itself never had companyId; the event envelope is the only source.
+    expect((ctx as any).companyId).toBeUndefined();
+  });
+
   it("does not write extra scopes when ids are absent", async () => {
     const dbPath = createDb();
     const { state, ctx: stateCtx } = fakeStateCtx();
@@ -371,7 +400,8 @@ describe("extractRunStartedFields", () => {
     expect(extractRunStartedFields(sdkEvent)).toEqual({
       runId: "run-from-sdk",
       agentId: "agent-from-sdk",
-      issueId: "issue-from-payload"
+      issueId: "issue-from-payload",
+      companyId: "co-uuid"
     });
   });
 

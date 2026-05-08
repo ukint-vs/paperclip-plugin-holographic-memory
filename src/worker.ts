@@ -12,6 +12,7 @@ interface AgentRunStartedEvent {
   issueId?: string;
   agentId?: string;
   runId?: string;
+  companyId?: string;
 }
 
 interface ToolParams {
@@ -84,9 +85,11 @@ export function extractRunStartedFields(event: any): AgentRunStartedEvent {
   const runId = event?.entityId ?? event?.runId ?? payload.runId;
   const agentId = event?.actorId ?? event?.agentId ?? payload.agentId;
   const issueId = event?.issueId ?? payload.issueId;
+  const companyId = event?.companyId ?? payload.companyId;
   if (typeof runId === "string" && runId) fields.runId = runId;
   if (typeof agentId === "string" && agentId) fields.agentId = agentId;
   if (typeof issueId === "string" && issueId) fields.issueId = issueId;
+  if (typeof companyId === "string" && companyId) fields.companyId = companyId;
   return fields;
 }
 
@@ -99,7 +102,11 @@ export async function handleRunStarted(
     return undefined;
   }
 
-  const issue = await ctx.issues?.get?.(event.issueId, ctx.companyId);
+  // companyId is on the PluginEvent envelope (PLUGIN_SPEC §16) and required
+  // by issues.get; passing undefined makes the SDK return null and silently
+  // disables automated recall. Fall back to ctx.companyId only for tests.
+  const companyId = event.companyId ?? (ctx as any).companyId;
+  const issue = await ctx.issues?.get?.(event.issueId, companyId);
   const query = [issue?.title, issue?.description, issue?.body]
     .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
     .join("\n");
