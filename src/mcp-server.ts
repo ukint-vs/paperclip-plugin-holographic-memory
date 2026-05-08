@@ -16,6 +16,17 @@ import type { HolographicMemoryConfig } from "./types.js";
 // [mcp_servers.holographic-memory]). Reads the same SQLite DB as the
 // Paperclip worker and the same on-disk recall cache. See README "Using with
 // claude_local and codex_local" for setup; see issue #20 for why this exists.
+//
+// Cross-tenant posture (intentional today):
+// MCP standalone mode is **tenant-blind**. It calls dispatchStandaloneAction
+// without a runCtx, so cross-tenant scoping (CoreActionHandler's optional
+// `runCtx.companyId`) defaults to undefined and reads see every company's
+// facts on the configured dbPath. This is fine for a single-company Paperclip
+// instance (the current shipped configuration) but breaks isolation if a
+// shared dbPath is used by multiple companies. To run multi-tenant safely
+// today, run a separate MCP server instance per company with a per-company
+// dbPath. The follow-up to wire companyId through the MCP tool schema lives
+// alongside the recall-cache namespacing work — both are #9-adjacent.
 
 function envBool(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined) return fallback;
