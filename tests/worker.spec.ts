@@ -4,7 +4,13 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import type { ScopeKey, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { describe, expect, it } from "vitest";
-import { ACTION_HANDLERS, dispatchAction, handleRunStarted } from "../src/worker.js";
+import {
+  ACTION_HANDLERS,
+  buildToolDescription,
+  dispatchAction,
+  extractRunStartedFields,
+  handleRunStarted
+} from "../src/worker.js";
 import { MemoryStore } from "../src/memory-store.js";
 import type { HolographicMemoryConfig, RecallState } from "../src/types.js";
 
@@ -343,6 +349,89 @@ describe("ACTION_HANDLERS shape (D6)", () => {
     for (const action of expected) {
       expect(typeof ACTION_HANDLERS[action]).toBe("function");
     }
+  });
+});
+
+describe("extractRunStartedFields", () => {
+  it("unwraps a realistic PluginEvent shape (entityId/actorId at top level)", () => {
+    // Mirrors the SDK's `PluginEvent<TPayload>` shape used by the host
+    // when emitting `agent.run.started` events.
+    const sdkEvent = {
+      eventId: "evt-uuid",
+      eventType: "agent.run.started",
+      occurredAt: "2026-05-08T12:00:00.000Z",
+      actorId: "agent-from-sdk",
+      actorType: "agent" as const,
+      entityId: "run-from-sdk",
+      entityType: "agent_run",
+      companyId: "co-uuid",
+      payload: { issueId: "issue-from-payload" }
+    };
+
+    expect(extractRunStartedFields(sdkEvent)).toEqual({
+      runId: "run-from-sdk",
+      agentId: "agent-from-sdk",
+      issueId: "issue-from-payload"
+    });
+  });
+
+  it("falls back to flat duck-typed shape used in tests", () => {
+    const flat = { runId: "r1", agentId: "a1", issueId: "i1" };
+    expect(extractRunStartedFields(flat)).toEqual(flat);
+  });
+
+  it("prefers SDK top-level fields over payload fields when both are present", () => {
+    // If the host puts duplicates in payload, the canonical entityId/actorId
+    // win because that's where the SDK guarantees them.
+    const event = {
+      entityId: "run-canonical",
+      actorId: "agent-canonical",
+      payload: { runId: "run-shadowed", agentId: "agent-shadowed", issueId: "issue-payload" }
+    };
+    expect(extractRunStartedFields(event)).toEqual({
+      runId: "run-canonical",
+      agentId: "agent-canonical",
+      issueId: "issue-payload"
+    });
+  });
+
+  it("omits undefined keys when fields are missing (no { runId: undefined } leak)", () => {
+    const minimal = { payload: { issueId: "only-issue" } };
+    const out = extractRunStartedFields(minimal);
+    expect(out).toEqual({ issueId: "only-issue" });
+    expect("runId" in out).toBe(false);
+    expect("agentId" in out).toBe(false);
+  });
+
+  it("returns an empty object for null / undefined / empty input", () => {
+    expect(extractRunStartedFields(null)).toEqual({});
+    expect(extractRunStartedFields(undefined)).toEqual({});
+    expect(extractRunStartedFields({})).toEqual({});
+  });
+});
+
+describe("buildToolDescription", () => {
+  it("includes the fact count and the four required usage cues", () => {
+    const description = buildToolDescription(42);
+
+    // Fact-count line acts as the system-prompt surrogate's status block.
+    expect(description).toContain("42 facts available");
+
+    // Hermes-style usage instructions the agent prompt depends on.
+    expect(description).toMatch(/recall_context/);
+    expect(description).toMatch(/\badd\b/);
+    expect(description).toMatch(/feedback/);
+    expect(description).toMatch(/retainEnabled/);
+  });
+
+  it("renders zero-fact state without breaking the fact-count line", () => {
+    const description = buildToolDescription(0);
+    expect(description).toContain("0 facts available");
+  });
+
+  it("returns multi-line text (no host-side trimming risk on a single blob)", () => {
+    const description = buildToolDescription(1);
+    expect(description.split("\n").length).toBeGreaterThan(3);
   });
 });
 

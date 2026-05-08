@@ -69,16 +69,19 @@ export default definePlugin({
   }
 });
 
-function extractRunStartedFields(event: any): AgentRunStartedEvent {
+export function extractRunStartedFields(event: any): AgentRunStartedEvent {
   // PluginEvent gives us companyId/actorId/entityId at the top level and a
   // typed payload underneath. Pull the IDs we care about from either spot,
   // tolerating the duck-typed test ctx that hands us a flat object.
   const payload = event?.payload ?? event ?? {};
-  return {
-    runId: event?.entityId ?? event?.runId ?? payload.runId,
-    agentId: event?.actorId ?? event?.agentId ?? payload.agentId,
-    issueId: event?.issueId ?? payload.issueId
-  };
+  const fields: AgentRunStartedEvent = {};
+  const runId = event?.entityId ?? event?.runId ?? payload.runId;
+  const agentId = event?.actorId ?? event?.agentId ?? payload.agentId;
+  const issueId = event?.issueId ?? payload.issueId;
+  if (typeof runId === "string" && runId) fields.runId = runId;
+  if (typeof agentId === "string" && agentId) fields.agentId = agentId;
+  if (typeof issueId === "string" && issueId) fields.issueId = issueId;
+  return fields;
 }
 
 export async function handleRunStarted(
@@ -410,7 +413,7 @@ function readFactCount(config: HolographicMemoryConfig): number {
   }
 }
 
-function buildToolDescription(factCount: number): string {
+export function buildToolDescription(factCount: number): string {
   return [
     `Holographic memory store. ${factCount} facts available.`,
     "",
