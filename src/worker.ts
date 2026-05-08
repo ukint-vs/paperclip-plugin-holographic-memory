@@ -2,7 +2,26 @@ import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 import type { ScopeKey, ToolResult, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { formatFactsAsText, formatFactsForPrompt } from "./context-injector.js";
 import { resolvePluginConfig } from "./config.js";
-import { MemoryStore } from "./memory-store.js";
+import { gcStaleCache, readRecallCache, writeRecallCache } from "./recall-cache.js";
+import {
+  READ_ACTIONS,
+  WRITE_ACTIONS,
+  closeStores,
+  err,
+  getStore,
+  handleAdd,
+  handleFeedback,
+  handleList,
+  handleProbe,
+  handleRelated,
+  handleReason,
+  handleRemove,
+  handleSearch,
+  handleUpdate,
+  type CoreActionHandler,
+  type ToolParams
+} from "./dispatch.js";
+import type { MemoryStore } from "./memory-store.js";
 import type { HolographicMemoryConfig, RecallState } from "./types.js";
 
 const STATE_NAMESPACE = "recall";
@@ -15,50 +34,6 @@ interface AgentRunStartedEvent {
   companyId?: string;
 }
 
-interface ToolParams {
-  action?: string;
-  // Read params
-  query?: string;
-  entity?: string;
-  entities?: string[];
-  category?: string;
-  fact_id?: number;
-  helpful?: boolean;
-  limit?: number;
-  min_trust?: number;
-  // Recall params
-  run_id?: string;
-  issue_id?: string;
-  agent_id?: string;
-  // Write params
-  content?: string;
-  tags?: string | string[];
-  trust_score?: number;
-  trust_delta?: number;
-}
-
-// MemoryStore registry keyed by dbPath. The plugin is intentionally
-// instance-scoped (one DB per Paperclip instance, per the README and
-// Hermes parity), but keying by path lets onConfigChanged swap the
-// path at runtime without leaking a stale connection. Closed in onShutdown.
-const storeRegistry = new Map<string, MemoryStore>();
-
-function getStore(config: HolographicMemoryConfig): MemoryStore {
-  let store = storeRegistry.get(config.dbPath);
-  if (!store) {
-    store = new MemoryStore(config.dbPath);
-    storeRegistry.set(config.dbPath, store);
-  }
-  return store;
-}
-
-function closeStores(): void {
-  for (const store of storeRegistry.values()) {
-    store.close();
-  }
-  storeRegistry.clear();
-}
-
 const plugin = definePlugin({
   async setup(ctx: any) {
     const config = resolvePluginConfig(await readConfig(ctx));
@@ -66,6 +41,14 @@ const plugin = definePlugin({
     registerSettings(ctx, config);
     registerSearchTool(ctx, config);
 
+    // Recall is wired only via in-process Paperclip RPC here. To make the
+    // tool reachable from claude_local / codex_local subprocesses (which
+    // don't see ctx.tools.register), we ship a separate stdio MCP server in
+    // src/mcp-server.ts plus a setup script that registers it in the user's
+    // Claude/Codex MCP config. Do NOT auto-write per-run MCP config from
+    // this worker — Paperclip's claude-local seed dir is content-hashed
+    // (see paperclip claude-config.ts:40-50) and a per-run write would
+    // invalidate the seed cache and race concurrent agents. See issue #20.
     ctx.events?.on?.("agent.run.started", async (event: any) => {
       const payload = extractRunStartedFields(event);
       await handleRunStarted(ctx, payload, config);
@@ -153,6 +136,20 @@ export async function handleRunStarted(
       .map((scope) => writeScopeState(ctx, scope, state))
   );
 
+  // Mirror to the on-disk recall cache so the standalone MCP server (claude_local
+  // / codex_local subprocesses) can resolve recall_context across processes.
+  // Best-effort: write failures are logged, never thrown — agent runs must
+  // not break because the cache is unhappy. GC stale entries in the same pass.
+  const log = (m: string) => ctx.log?.warn?.(m) ?? ctx.logger?.warn?.(m) ?? undefined;
+  // exactOptionalPropertyTypes requires we omit undefined properties rather
+  // than assigning `undefined` to optional fields.
+  const ids: { runId?: string; issueId?: string; agentId?: string } = {};
+  if (event.runId) ids.runId = event.runId;
+  if (event.issueId) ids.issueId = event.issueId;
+  if (event.agentId) ids.agentId = event.agentId;
+  await writeRecallCache(config.dbPath, state, ids, log);
+  await gcStaleCache(config.dbPath, undefined, undefined, log);
+
   return state;
 }
 
@@ -179,77 +176,18 @@ async function readScopeState(ctx: any, scope: ScopeKey): Promise<RecallState | 
 }
 
 // ---------------------------------------------------------------------------
-// Action handlers — exported for direct invocation in tests.
+// recall_context — only ctx-aware handler; lives here because it reads
+// plugin state populated on agent.run.started. Other handlers are in
+// dispatch.ts so the standalone MCP server can reuse them.
 // ---------------------------------------------------------------------------
 
-type ActionHandler = (
+type CtxActionHandler = (
   store: MemoryStore,
   params: ToolParams,
   config: HolographicMemoryConfig,
   ctx: any,
   runCtx: ToolRunContext
 ) => Promise<ToolResult>;
-
-function err(message: string): ToolResult {
-  return { content: message, error: message };
-}
-
-async function handleSearch(store: MemoryStore, params: ToolParams, config: HolographicMemoryConfig): Promise<ToolResult> {
-  if (!params.query?.trim()) return err("Missing required parameter: query");
-  const facts = store.search(params.query, {
-    limit: params.limit ?? 5,
-    minTrust: params.min_trust ?? config.minTrustScore
-  });
-  return { content: formatFactsAsText(facts) };
-}
-
-async function handleProbe(store: MemoryStore, params: ToolParams, config: HolographicMemoryConfig): Promise<ToolResult> {
-  if (!params.entity?.trim()) return err("Missing required parameter: entity");
-  const facts = store.probe(params.entity, {
-    limit: params.limit ?? 5,
-    minTrust: params.min_trust ?? config.minTrustScore
-  });
-  return { content: formatFactsAsText(facts) };
-}
-
-async function handleRelated(store: MemoryStore, params: ToolParams, config: HolographicMemoryConfig): Promise<ToolResult> {
-  if (!params.entity?.trim()) return err("Missing required parameter: entity");
-  const facts = store.related(params.entity, {
-    limit: params.limit ?? 5,
-    minTrust: params.min_trust ?? config.minTrustScore
-  });
-  return { content: formatFactsAsText(facts) };
-}
-
-async function handleReason(store: MemoryStore, params: ToolParams, config: HolographicMemoryConfig): Promise<ToolResult> {
-  if (!Array.isArray(params.entities) || params.entities.length === 0) {
-    return err("Missing required parameter: entities");
-  }
-  const facts = store.reason(params.entities, {
-    limit: params.limit ?? 5,
-    minTrust: params.min_trust ?? config.minTrustScore
-  });
-  return { content: formatFactsAsText(facts) };
-}
-
-async function handleList(store: MemoryStore, params: ToolParams, config: HolographicMemoryConfig): Promise<ToolResult> {
-  const options: { limit: number; minTrust: number; category?: string } = {
-    limit: params.limit ?? 5,
-    minTrust: params.min_trust ?? config.minTrustScore
-  };
-  if (params.category) options.category = params.category;
-  const facts = store.listFacts(options);
-  // D6 / Codex C10: list is a CRUD/inventory op, returns JSON.
-  return { content: JSON.stringify({ facts, count: facts.length }), data: { facts, count: facts.length } };
-}
-
-async function handleFeedback(store: MemoryStore, params: ToolParams): Promise<ToolResult> {
-  if (typeof params.fact_id !== "number" || typeof params.helpful !== "boolean") {
-    return err("Missing required parameters: fact_id and helpful");
-  }
-  const result = store.recordFeedback(params.fact_id, params.helpful);
-  return { content: JSON.stringify(result), data: result };
-}
 
 async function handleRecallContext(
   store: MemoryStore,
@@ -276,6 +214,23 @@ async function handleRecallContext(
     }
   }
 
+  // Fall back to the on-disk recall cache. In-Paperclip we usually hit
+  // ctx.state above; this branch covers the case where ctx.state was never
+  // populated (e.g. plugin restart between agent.run.started and the tool
+  // call) and serves the same source of truth the standalone MCP server reads.
+  const fileLookups: Array<["run" | "issue" | "agent", string]> = [];
+  if (params.run_id) fileLookups.push(["run", params.run_id]);
+  if (params.issue_id) fileLookups.push(["issue", params.issue_id]);
+  if (params.agent_id) fileLookups.push(["agent", params.agent_id]);
+  if (runCtx?.runId) fileLookups.push(["run", runCtx.runId]);
+  if (runCtx?.agentId) fileLookups.push(["agent", runCtx.agentId]);
+  for (const [scope, scopeId] of fileLookups) {
+    const cached = await readRecallCache(config.dbPath, scope, scopeId);
+    if (cached?.formatted) {
+      return { content: cached.formatted, data: cached };
+    }
+  }
+
   if (params.query?.trim()) {
     const facts = store.search(params.query, {
       limit: params.limit ?? config.maxFactsPerRecall,
@@ -290,54 +245,30 @@ async function handleRecallContext(
   };
 }
 
-async function handleAdd(store: MemoryStore, params: ToolParams): Promise<ToolResult> {
-  if (typeof params.content !== "string" || !params.content.trim()) {
-    return err("Missing required parameter: content");
-  }
-  const fact: Parameters<MemoryStore["addFact"]>[0] = { content: params.content };
-  if (typeof params.category === "string") fact.category = params.category;
-  if (params.tags !== undefined) fact.tags = params.tags;
-  if (typeof params.trust_score === "number") fact.trustScore = params.trust_score;
-  const result = store.addFact(fact);
-  return { content: JSON.stringify(result), data: result };
+// Adapter that bridges a CoreActionHandler (which returns a DispatchToolResult)
+// into the ctx-aware ActionHandler shape expected by the worker dispatch.
+function adaptCore(handler: CoreActionHandler): CtxActionHandler {
+  return async (store, params, config) => {
+    const result = await handler(store, params, config);
+    // DispatchToolResult and ToolResult are structurally identical for our
+    // purposes (content + optional data + optional error). The cast keeps
+    // the SDK type contract without re-allocating.
+    return result as ToolResult;
+  };
 }
 
-async function handleUpdate(store: MemoryStore, params: ToolParams): Promise<ToolResult> {
-  if (typeof params.fact_id !== "number") {
-    return err("Missing required parameter: fact_id");
-  }
-  const partial: Parameters<MemoryStore["updateFact"]>[1] = {};
-  if (typeof params.content === "string") partial.content = params.content;
-  if (typeof params.category === "string") partial.category = params.category;
-  if (params.tags !== undefined) partial.tags = params.tags;
-  if (typeof params.trust_delta === "number") partial.trustDelta = params.trust_delta;
-  const result = store.updateFact(params.fact_id, partial);
-  return { content: JSON.stringify(result), data: result };
-}
-
-async function handleRemove(store: MemoryStore, params: ToolParams): Promise<ToolResult> {
-  if (typeof params.fact_id !== "number") {
-    return err("Missing required parameter: fact_id");
-  }
-  const result = store.removeFact(params.fact_id);
-  return { content: JSON.stringify(result), data: result };
-}
-
-export const ACTION_HANDLERS: Record<string, ActionHandler> = {
-  search: handleSearch,
-  probe: handleProbe,
-  related: handleRelated,
-  reason: handleReason,
+export const ACTION_HANDLERS: Record<string, CtxActionHandler> = {
+  search: adaptCore(handleSearch),
+  probe: adaptCore(handleProbe),
+  related: adaptCore(handleRelated),
+  reason: adaptCore(handleReason),
   recall_context: handleRecallContext,
-  list: handleList,
-  feedback: handleFeedback,
-  add: handleAdd,
-  update: handleUpdate,
-  remove: handleRemove
+  list: adaptCore(handleList),
+  feedback: adaptCore(handleFeedback),
+  add: adaptCore(handleAdd),
+  update: adaptCore(handleUpdate),
+  remove: adaptCore(handleRemove)
 };
-
-const READ_ACTIONS = new Set(["search", "probe", "related", "reason", "recall_context", "list", "feedback"]);
-const WRITE_ACTIONS = new Set(["add", "update", "remove"]);
 
 export async function dispatchAction(
   params: ToolParams,
@@ -347,7 +278,7 @@ export async function dispatchAction(
 ): Promise<ToolResult> {
   const action = params.action ?? "search";
   const handler = ACTION_HANDLERS[action];
-  if (!handler) return err(`Unknown memory action: ${action}`);
+  if (!handler) return err(`Unknown memory action: ${action}`) as ToolResult;
 
   if (READ_ACTIONS.has(action) && !config.recallEnabled) {
     return { content: "Holographic memory recall is disabled." };
