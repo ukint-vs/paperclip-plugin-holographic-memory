@@ -34,22 +34,26 @@ state for the run, and expose an agent tool for targeted recall.
 
 ## Installation
 
-This is an independent plugin, not an official Paperclip package. Until it is
-published to npm or added to a Paperclip marketplace, install it as a local path
-plugin from this checkout.
+This is an independent plugin published on npm as
+[`paperclip-plugin-holographic-memory`](https://www.npmjs.com/package/paperclip-plugin-holographic-memory).
+Install it through your running Paperclip instance:
+
+```bash
+curl -X POST http://127.0.0.1:3100/api/plugins/install \
+  -H "Content-Type: application/json" \
+  -d '{"packageName":"paperclip-plugin-holographic-memory"}'
+```
+
+Then configure it in Paperclip Settings -> Plugins -> Holographic Memory.
+
+### Local development install
+
+To install from a checkout (e.g. while iterating on the plugin):
 
 ```bash
 curl -X POST http://127.0.0.1:3100/api/plugins/install \
   -H "Content-Type: application/json" \
   -d '{"packageName":"/absolute/path/to/paperclip-plugin-holographic-memory","isLocalPath":true}'
-```
-
-Then configure it in Paperclip Settings -> Plugins -> Holographic Memory.
-
-If this package is later published to npm, the install command can become:
-
-```bash
-pnpm paperclipai plugin install paperclip-plugin-holographic-memory
 ```
 
 ## Configuration
