@@ -8,6 +8,21 @@ import type { AgentRunEvent, HolographicMemoryConfig, RecallState } from "./type
 
 const STATE_NAMESPACE = "recall";
 const STATE_KEY = "context";
+
+// Auto-extract trust ladder. Trust answers "how confident are we?" — it is
+// NOT a visibility switch. Visibility belongs to the `source` column.
+//
+//   0.5+   curated / explicit / higher-confidence facts
+//   0.3    auto-extracted, acceptable but weak  ← this PR
+//   <0.3   normally hidden unless minTrust is lowered
+//
+// At 0.3, auto-facts pass the default `minTrustScore` filter (also 0.3,
+// inclusive `>=`) and surface in default recall, ranked below curated
+// 0.5+ facts in the score blend. If we ever want to hide auto-facts from
+// default recall, the right knob is `source = 'auto'` (e.g. an
+// `excludeAutoFacts` option on the recall query) — NOT pushing trust
+// below the floor, which would falsely claim the facts are below the
+// system's quality bar.
 const AUTO_EXTRACT_TRUST = 0.3;
 const AUTO_EXTRACT_SOURCE = "auto";
 
