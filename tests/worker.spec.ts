@@ -239,38 +239,30 @@ describe("worker", () => {
     const dbPath = createDb();
     const { ctx: stateCtx } = fakeStateCtx();
     const error = vi.fn();
-    const info = vi.fn();
     const ctx = {
       ...stateCtx,
-      logger: { info, warn: vi.fn(), error },
+      logger: { info: vi.fn(), warn: vi.fn(), error },
       issues: {
-        // Force a query that triggers FTS, then break the store via a
-        // shadowed config dbPath that's invalid — simpler: spy on the
-        // store search via a thrown-at-top-level approach.
         get: async () => ({ title: "Vara wallet IDL" })
       }
     };
 
-    // Simulate search failure by pointing at a non-existent dbPath
-    // parent that better-sqlite3 cannot create.
-    const config = baseConfig(dbPath);
-    // Override store.search via prototype patch on the singleton.
-    const { MemoryStore: MS } = await import("../src/memory-store.js");
-    const origSearch = MS.prototype.search;
-    MS.prototype.search = function () {
+    // vi.spyOn auto-restores after the test, so this is parallel-safe
+    // even though MemoryStore.prototype is shared module state.
+    const spy = vi.spyOn(MemoryStore.prototype, "search").mockImplementation(() => {
       throw new Error("synthetic search failure");
-    };
+    });
     try {
       const result = await handleRunStarted(
         ctx,
         { issueId: "issue-search-throw", runId: "run-x" },
-        config
+        baseConfig(dbPath)
       );
       expect(result).toBeUndefined();
       expect(error).toHaveBeenCalledTimes(1);
       expect(error.mock.calls[0]?.[0]).toBe("recall: search failed");
     } finally {
-      MS.prototype.search = origSearch;
+      spy.mockRestore();
     }
   });
 
@@ -307,13 +299,13 @@ describe("worker", () => {
       issues: { get: async () => ({ title: "Vara wallet IDL" }) }
     };
 
-    const { MemoryStore: MS } = await import("../src/memory-store.js");
-    const origSearch = MS.prototype.search;
     const captured: Array<Record<string, unknown> | undefined> = [];
-    MS.prototype.search = function (this: unknown, query: string, options?: Record<string, unknown>) {
-      captured.push(options);
-      return origSearch.call(this as never, query, options as never);
-    } as typeof origSearch;
+    const spy = vi
+      .spyOn(MemoryStore.prototype, "search")
+      .mockImplementation(function (this: MemoryStore, _query, options) {
+        captured.push(options as Record<string, unknown> | undefined);
+        return [];
+      });
     try {
       await handleRunStarted(
         ctx,
@@ -323,7 +315,7 @@ describe("worker", () => {
       expect(captured).toHaveLength(1);
       expect(captured[0]?.companyId).toBe("co-tenant-x");
     } finally {
-      MS.prototype.search = origSearch;
+      spy.mockRestore();
     }
   });
 });

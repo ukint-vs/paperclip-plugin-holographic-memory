@@ -130,9 +130,6 @@ export async function handleRunStarted(
   event: AgentRunEvent,
   config: HolographicMemoryConfig
 ): Promise<RecallState | undefined> {
-  // Logger-only instrumentation per TODO #7. Every exit path emits a
-  // structured log so server logs alone tell us "did recall contribute,
-  // and if not, why".
   const startedAt = Date.now();
   const elapsed = (): number => Date.now() - startedAt;
   const eventIds = {
@@ -188,15 +185,19 @@ export async function handleRunStarted(
 
   if (!facts.length) return skip("no_facts");
 
-  // Aggregates for the structured log: avgScore tells "did the search
-  // find good matches", avgTrust tells "are surfaced facts trustworthy",
-  // maxScore catches a single strong hit hidden by a weak average.
   const round3 = (n: number): number => Math.round(n * 1000) / 1000;
-  const scores = facts.map((f) => f.score ?? 0);
-  const trusts = facts.map((f) => f.trustScore);
-  const avgScore = round3(scores.reduce((a, b) => a + b, 0) / scores.length);
-  const maxScore = round3(Math.max(...scores));
-  const avgTrust = round3(trusts.reduce((a, b) => a + b, 0) / trusts.length);
+  let sumScore = 0;
+  let maxScoreRaw = 0;
+  let sumTrust = 0;
+  for (const fact of facts) {
+    const score = fact.score ?? 0;
+    sumScore += score;
+    if (score > maxScoreRaw) maxScoreRaw = score;
+    sumTrust += fact.trustScore;
+  }
+  const avgScore = round3(sumScore / facts.length);
+  const maxScore = round3(maxScoreRaw);
+  const avgTrust = round3(sumTrust / facts.length);
 
   const state: RecallState = {
     query,
@@ -534,11 +535,11 @@ async function handleRecallContext(
   }
 
   if (params.query?.trim()) {
-    const opts: { limit: number; minTrust: number; companyId?: string } = {
-      limit: params.limit ?? config.maxFactsPerRecall,
-      minTrust: params.min_trust ?? config.minTrustScore
-    };
-    if (runCtx?.companyId) opts.companyId = runCtx.companyId;
+    // recall_context's live-search fallback uses maxFactsPerRecall (not
+    // the read-handler default of 5) so the cached-vs-search split
+    // behaves consistently. readOptions() handles companyId pass-through.
+    const opts = readOptions(params, config, runCtx);
+    opts.limit = params.limit ?? config.maxFactsPerRecall;
     const facts = store.search(params.query, opts);
     return { content: formatFactsAsText(facts) };
   }
