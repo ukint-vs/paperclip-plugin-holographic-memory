@@ -12,15 +12,37 @@ The runtime pattern follows the Paperclip memory integration shape used by
 Hindsight: recall on `agent.run.started`, cache formatted context in plugin
 state for the run, and expose an agent tool for targeted recall.
 
-## v1 scope
+## What it does
 
 - Isolated Paperclip memory DB, created on first use.
 - Runtime recall from local SQLite.
-- FTS5 fact search plus entity-linked fallback.
+- FTS5/Jaccard/trust-ranked fact search.
+- Hermes-style entity extraction and entity-linked recall.
+- Deterministic HRR vectors on inserted facts.
+- Category memory banks stored as `cat:<category>`.
+- Fact feedback that adjusts trust scores.
 - One-time seed script from Paperclip Postgres.
 - No event-driven fact extraction.
-- No HRR vector algebra.
-- No multi-bank routing.
+
+## Installation
+
+This is an independent plugin, not an official Paperclip package. Until it is
+published to npm or added to a Paperclip marketplace, install it as a local path
+plugin from this checkout.
+
+```bash
+curl -X POST http://127.0.0.1:3100/api/plugins/install \
+  -H "Content-Type: application/json" \
+  -d '{"packageName":"/absolute/path/to/paperclip-plugin-holographic-memory","isLocalPath":true}'
+```
+
+Then configure it in Paperclip Settings -> Plugins -> Holographic Memory.
+
+If this package is later published to npm, the install command can become:
+
+```bash
+pnpm paperclipai plugin install paperclip-plugin-holographic-memory
+```
 
 ## Configuration
 
@@ -83,6 +105,26 @@ MEMORY CONTEXT:
 1. [id=1; project; trust=0.50 score=0.250 tags=vara-wallet] ...
 ```
 
+## How it works
+
+```text
+agent.run.started
+  -> recall(issue title + description)
+  -> store formatted MEMORY CONTEXT in plugin state for this run
+
+agent running...
+  -> holographic_memory_search(action="search" | "probe" | "reason" | ...)
+
+seed:paperclip
+  -> read Paperclip Postgres
+  -> extract durable facts
+  -> insert through MemoryStore so entities, HRR vectors, and banks stay consistent
+```
+
+Memory is keyed by the isolated SQLite file, not by a Paperclip session or run.
+Delete `~/.paperclip/instances/default/hermes-memory.db` to reset Paperclip
+agent memory without touching personal Hermes memory.
+
 ## Development
 
 ```bash
@@ -94,3 +136,13 @@ pnpm build
 
 Network access is required to install `@paperclipai/plugin-sdk` and other npm
 dependencies.
+
+## References
+
+- [Paperclip](https://github.com/paperclipai/paperclip) - Open-source orchestration platform.
+- [Paperclip Plugin Authoring Guide](https://github.com/paperclipai/paperclip/blob/master/doc/plugins/PLUGIN_AUTHORING_GUIDE.md) - current plugin authoring surface.
+- [Paperclip Plugin SDK README](https://github.com/paperclipai/paperclip/blob/master/packages/plugins/sdk/README.md) - SDK package reference.
+- [awesome-paperclip](https://github.com/gsxdsm/awesome-paperclip) - curated list of Paperclip plugins and resources.
+- [Hindsight Paperclip integration](https://github.com/vectorize-io/hindsight/tree/main/hindsight-integrations/paperclip) - reference pattern for recall before runs, agent tools, and plugin state.
+- [Hermes memory providers](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory-providers/) - Hermes memory provider overview.
+- [Hermes holographic memory source](https://github.com/NousResearch/hermes-agent/tree/main/plugins/memory/holographic) - upstream provider model for facts, entities, HRR vectors, and memory banks.
