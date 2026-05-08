@@ -5,6 +5,10 @@
   "type": "module",
   "main": "dist/worker.js",
   "types": "dist/worker.d.ts",
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js"
+  },
   "files": [
     "dist",
     "src",
