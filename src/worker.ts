@@ -1,5 +1,6 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 import type { ScopeKey, ToolResult, ToolRunContext } from "@paperclipai/plugin-sdk";
+import { extractFactsFromText } from "./auto-extract.js";
 import { formatFactsAsText, formatFactsForPrompt } from "./context-injector.js";
 import { resolvePluginConfig } from "./config.js";
 import {
@@ -28,16 +29,35 @@ import {
   type ToolParams
 } from "./dispatch.js";
 import type { MemoryStore } from "./memory-store.js";
-import type { HolographicMemoryConfig, RecallState } from "./types.js";
+import type { AgentRunEvent, HolographicMemoryConfig, RecallState } from "./types.js";
 
 const STATE_NAMESPACE = "recall";
 const STATE_KEY = "context";
 
-interface AgentRunStartedEvent {
-  issueId?: string;
-  agentId?: string;
-  runId?: string;
-  companyId?: string;
+// Auto-extract trust ladder. Trust answers "how confident are we?" — it is
+// NOT a visibility switch. Visibility belongs to the `source` column.
+//
+//   0.5+   curated / explicit / higher-confidence facts
+//   0.3    auto-extracted, acceptable but weak  ← this PR
+//   <0.3   normally hidden unless minTrust is lowered
+//
+// At 0.3, auto-facts pass the default `minTrustScore` filter (also 0.3,
+// inclusive `>=`) and surface in default recall, ranked below curated
+// 0.5+ facts in the score blend. If we ever want to hide auto-facts from
+// default recall, the right knob is `source = 'auto'` (e.g. an
+// `excludeAutoFacts` option on the recall query) — NOT pushing trust
+// below the floor, which would falsely claim the facts are below the
+// system's quality bar.
+const AUTO_EXTRACT_TRUST = 0.3;
+const AUTO_EXTRACT_SOURCE = "auto";
+
+// joinIssueText is shared by handleRunStarted (recall query) and
+// handleRunFinished (auto-extract source text). storeRegistry / getStore /
+// closeStores live in dispatch.ts so the standalone MCP server reuses them.
+function joinIssueText(issue: any): string {
+  return [issue?.title, issue?.description, issue?.body]
+    .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
+    .join("\n");
 }
 
 const plugin = definePlugin({
@@ -56,8 +76,17 @@ const plugin = definePlugin({
     // (see paperclip claude-config.ts:40-50) and a per-run write would
     // invalidate the seed cache and race concurrent agents. See issue #20.
     ctx.events?.on?.("agent.run.started", async (event: any) => {
-      const payload = extractRunStartedFields(event);
+      const payload = extractRunFields(event);
       await handleRunStarted(ctx, payload, config);
+    });
+
+    // Auto-extract durable facts from the issue body + contemporaneous
+    // human comments after each completed run (#11). Skipped on
+    // `agent.run.failed` — failed runs produce noisy/misleading content,
+    // matches Hermes' on_session_end posture.
+    ctx.events?.on?.("agent.run.finished", async (event: any) => {
+      const payload = extractRunFields(event);
+      await handleRunFinished(ctx, payload, config);
     });
   },
   async onShutdown() {
@@ -68,26 +97,29 @@ const plugin = definePlugin({
 export default plugin;
 runWorker(plugin, import.meta.url);
 
-export function extractRunStartedFields(event: any): AgentRunStartedEvent {
-  // PluginEvent gives us companyId/actorId/entityId at the top level and a
-  // typed payload underneath. Pull the IDs we care about from either spot,
-  // tolerating the duck-typed test ctx that hands us a flat object.
+export function extractRunFields(event: any): AgentRunEvent {
+  // PluginEvent ships IDs at the top level and a typed payload underneath;
+  // duck-type both spots so flat test fixtures also work.
   const payload = event?.payload ?? event ?? {};
-  const fields: AgentRunStartedEvent = {};
+  const fields: AgentRunEvent = {};
   const runId = event?.entityId ?? event?.runId ?? payload.runId;
   const agentId = event?.actorId ?? event?.agentId ?? payload.agentId;
   const issueId = event?.issueId ?? payload.issueId;
   const companyId = event?.companyId ?? payload.companyId;
+  const startedAt = event?.startedAt ?? payload.startedAt;
+  const finishedAt = event?.finishedAt ?? payload.finishedAt;
   if (typeof runId === "string" && runId) fields.runId = runId;
   if (typeof agentId === "string" && agentId) fields.agentId = agentId;
   if (typeof issueId === "string" && issueId) fields.issueId = issueId;
   if (typeof companyId === "string" && companyId) fields.companyId = companyId;
+  if (typeof startedAt === "string" && startedAt) fields.startedAt = startedAt;
+  if (typeof finishedAt === "string" && finishedAt) fields.finishedAt = finishedAt;
   return fields;
 }
 
 export async function handleRunStarted(
   ctx: any,
-  event: AgentRunStartedEvent,
+  event: AgentRunEvent,
   config: HolographicMemoryConfig
 ): Promise<RecallState | undefined> {
   if (!config.recallEnabled || !event.issueId) {
@@ -99,9 +131,7 @@ export async function handleRunStarted(
   // disables automated recall. Fall back to ctx.companyId only for tests.
   const companyId = event.companyId ?? (ctx as any).companyId;
   const issue = await ctx.issues?.get?.(event.issueId, companyId);
-  const query = [issue?.title, issue?.description, issue?.body]
-    .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
-    .join("\n");
+  const query = joinIssueText(issue);
 
   if (!query.trim()) {
     return undefined;
@@ -175,6 +205,119 @@ export async function handleRunStarted(
     );
 
   return state;
+}
+
+export async function handleRunFinished(
+  ctx: any,
+  event: AgentRunEvent,
+  config: HolographicMemoryConfig
+): Promise<{ inserted: number } | undefined> {
+  if (!config.retainEnabled) {
+    return undefined;
+  }
+  if (!event.issueId) {
+    return undefined;
+  }
+  const runLabel = event.runId ?? "<unknown>";
+
+  if (!event.startedAt || !event.finishedAt) {
+    // Fail closed: without honest timestamps we cannot attribute facts
+    // to this run, so we'd rather skip than write a misleading run_id.
+    ctx.logger?.warn?.(
+      `auto-extract: run ${runLabel} missing startedAt/finishedAt, skipping`
+    );
+    return undefined;
+  }
+
+  const issueId = event.issueId;
+  const runId = event.runId ?? null;
+  const agentId = event.agentId ?? null;
+  const companyId = event.companyId ?? (ctx as any).companyId;
+  const startedAtMs = Date.parse(event.startedAt);
+  const finishedAtMs = Date.parse(event.finishedAt);
+
+  if (Number.isNaN(startedAtMs) || Number.isNaN(finishedAtMs)) {
+    ctx.logger?.warn?.(
+      `auto-extract: run ${runLabel} has unparseable startedAt/finishedAt, skipping`
+    );
+    return undefined;
+  }
+
+  try {
+    // issues.get and listComments are independent — fetch in parallel
+    // so the handler pays max(get, listComments) rather than sum.
+    const [issue, rawComments] = await Promise.all([
+      ctx.issues?.get?.(issueId, companyId),
+      ctx.issues?.listComments?.(issueId, companyId)
+    ]);
+    const bodyText = joinIssueText(issue);
+
+    const filteredComments = (rawComments ?? []).filter((comment: any) => {
+      // Humans only — agent comments saying "I prefer X" are self-talk,
+      // not user preferences. authorUserId presence is the canonical
+      // "human authored" signal in the SDK shape.
+      if (!comment?.authorUserId) return false;
+      // Contemporaneous comments only, so run_id provenance stays
+      // honest. createdAt is Date or ISO string depending on host.
+      const createdAtMs =
+        comment.createdAt instanceof Date
+          ? comment.createdAt.getTime()
+          : Date.parse(String(comment.createdAt ?? ""));
+      if (Number.isNaN(createdAtMs)) return false;
+      return createdAtMs >= startedAtMs && createdAtMs <= finishedAtMs;
+    });
+
+    const sources: string[] = [];
+    if (bodyText.trim().length > 0) sources.push(bodyText);
+    for (const comment of filteredComments) {
+      if (typeof comment?.body === "string" && comment.body.trim().length > 0) {
+        sources.push(comment.body);
+      }
+    }
+
+    const store = getStore(config);
+    let insertedCount = 0;
+
+    for (const text of sources) {
+      const hits = extractFactsFromText(text);
+      for (const hit of hits) {
+        try {
+          // exactOptionalPropertyTypes forbids `field: undefined` on
+          // optional props; build incrementally and skip absent fields.
+          const fact: Parameters<MemoryStore["addFact"]>[0] = {
+            content: hit.content,
+            category: hit.category,
+            trustScore: AUTO_EXTRACT_TRUST,
+            source: AUTO_EXTRACT_SOURCE
+          };
+          if (agentId) fact.agentId = agentId;
+          if (runId) fact.runId = runId;
+          const result = store.addFact(fact);
+          if (result.inserted) insertedCount += 1;
+        } catch (err) {
+          // One bad insertion (SQLite lock race, constraint violation)
+          // must not abort peers in the same run.
+          ctx.logger?.warn?.(
+            `auto-extract: addFact failed in run ${runLabel}`,
+            err
+          );
+        }
+      }
+    }
+
+    ctx.logger?.info?.(
+      `auto-extract: issue ${issueId} run ${runLabel} → inserted ${insertedCount} facts`
+    );
+    return { inserted: insertedCount };
+  } catch (err) {
+    // Network blips on issues.get / listComments must not throw out of
+    // an SDK event handler.
+    ctx.logger?.error?.(
+      `auto-extract: failed for run ${runLabel}`,
+      err
+    );
+    return undefined;
+  }
 }
 
 function scopeFor(scopeKind: "run" | "issue" | "agent", scopeId: string): ScopeKey {

@@ -1,6 +1,6 @@
 {
   "name": "paperclip-plugin-holographic-memory",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Paperclip recall plugin with an isolated holographic SQLite memory store.",
   "type": "module",
   "main": "dist/worker.js",

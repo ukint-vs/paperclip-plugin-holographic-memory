@@ -15,6 +15,11 @@ export interface MemoryFact {
   retrievalCount: number;
   helpfulCount: number;
   score?: number;
+  // Provenance — NULL on curated facts, populated on auto-extracted
+  // ones so `WHERE source = 'auto'` works without a tags-string scan.
+  source: string | null;
+  agentId: string | null;
+  runId: string | null;
 }
 
 export interface MemorySearchOptions {
@@ -27,6 +32,21 @@ export interface NewMemoryFact {
   category?: string;
   tags?: string | string[];
   trustScore?: number;
+  source?: string;
+  agentId?: string;
+  runId?: string;
+}
+
+// Shared envelope shape duck-typed from `agent.run.started` and
+// `agent.run.finished`. `startedAt`/`finishedAt` only populated for
+// finished events; the time-window filter requires them.
+export interface AgentRunEvent {
+  runId?: string;
+  agentId?: string;
+  issueId?: string;
+  companyId?: string;
+  startedAt?: string;
+  finishedAt?: string;
 }
 
 export interface AddFactResult {

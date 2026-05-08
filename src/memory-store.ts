@@ -22,6 +22,9 @@ interface FactRow {
   retrieval_count: number | null;
   helpful_count: number | null;
   hrr_vector?: Buffer | null;
+  source?: string | null;
+  agent_id?: string | null;
+  run_id?: string | null;
   score?: number;
   fts_rank_raw?: number | null;
 }
@@ -120,6 +123,9 @@ export class MemoryStore {
     const tags = normalizeTags(fact.tags);
     const category = fact.category?.trim() || "general";
     const trustScore = normalizeTrust(fact.trustScore);
+    const source = normalizeProvenance(fact.source);
+    const agentId = normalizeProvenance(fact.agentId);
+    const runId = normalizeProvenance(fact.runId);
 
     const run = this.db.transaction((): AddFactResult => {
       const existing = this.db.prepare("SELECT fact_id FROM facts WHERE content = ?").get(content) as
@@ -131,8 +137,10 @@ export class MemoryStore {
       }
 
       const result = this.db
-        .prepare("INSERT INTO facts (content, category, tags, trust_score) VALUES (?, ?, ?, ?)")
-        .run(content, category, tags, trustScore);
+        .prepare(
+          "INSERT INTO facts (content, category, tags, trust_score, source, agent_id, run_id) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )
+        .run(content, category, tags, trustScore, source, agentId, runId);
       const factId = Number(result.lastInsertRowid);
       const entities = extractEntities(content);
 
@@ -259,7 +267,7 @@ export class MemoryStore {
     const placeholders = unique.map(() => "?").join(", ");
     const rows = this.db
       .prepare(
-        `SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score, f.retrieval_count, f.helpful_count, f.hrr_vector
+        `SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score, f.retrieval_count, f.helpful_count, f.hrr_vector, f.source, f.agent_id, f.run_id
          FROM facts f
          JOIN fact_entities fe ON f.fact_id = fe.fact_id
          JOIN entities e ON fe.entity_id = e.entity_id
@@ -283,7 +291,7 @@ export class MemoryStore {
     const roleContent = encodeAtom("__hrr_role_content__", this.hrrDim);
     const rows = this.db
       .prepare(
-        `SELECT fact_id, content, category, tags, trust_score, retrieval_count, helpful_count, hrr_vector
+        `SELECT fact_id, content, category, tags, trust_score, retrieval_count, helpful_count, hrr_vector, source, agent_id, run_id
          FROM facts
          WHERE hrr_vector IS NOT NULL
            AND COALESCE(trust_score, 0) >= ?`
@@ -308,7 +316,7 @@ export class MemoryStore {
     const minTrust = options.minTrust ?? 0;
     const rows = this.db
       .prepare(
-        `SELECT fact_id, content, category, tags, trust_score, retrieval_count, helpful_count, hrr_vector
+        `SELECT fact_id, content, category, tags, trust_score, retrieval_count, helpful_count, hrr_vector, source, agent_id, run_id
          FROM facts
          WHERE COALESCE(trust_score, 0) >= ?
            AND (? IS NULL OR category = ?)
@@ -356,20 +364,26 @@ export class MemoryStore {
       (this.db.prepare("PRAGMA table_info(facts)").all() as { name: string }[]).map((column) => column.name)
     );
 
-    if (!columns.has("helpful_count")) {
-      this.db.prepare("ALTER TABLE facts ADD COLUMN helpful_count INTEGER DEFAULT 0").run();
-    }
+    // Idempotent column-add shim — collapses into a real migration when
+    // the migration framework (#9) lands.
+    const addColumnIfMissing = (name: string, type: string): void => {
+      if (!columns.has(name)) {
+        this.db.prepare(`ALTER TABLE facts ADD COLUMN ${name} ${type}`).run();
+      }
+    };
 
-    if (!columns.has("hrr_vector")) {
-      this.db.prepare("ALTER TABLE facts ADD COLUMN hrr_vector BLOB").run();
-    }
+    addColumnIfMissing("helpful_count", "INTEGER DEFAULT 0");
+    addColumnIfMissing("hrr_vector", "BLOB");
+    addColumnIfMissing("source", "TEXT");
+    addColumnIfMissing("agent_id", "TEXT");
+    addColumnIfMissing("run_id", "TEXT");
   }
 
   private searchFts(query: string, limit: number, minTrust: number): ScorableFact[] {
     const rows = this.db
       .prepare(
         `SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score, f.retrieval_count,
-                f.helpful_count, f.hrr_vector, facts_fts.rank AS fts_rank_raw
+                f.helpful_count, f.hrr_vector, f.source, f.agent_id, f.run_id, facts_fts.rank AS fts_rank_raw
          FROM facts_fts
          JOIN facts f ON facts_fts.rowid = f.fact_id
          WHERE facts_fts MATCH ?
@@ -392,7 +406,7 @@ export class MemoryStore {
     const results = new Map<number, ScorableFact>();
     const stmt = this.db.prepare(
       `SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score, f.retrieval_count,
-              f.helpful_count, f.hrr_vector
+              f.helpful_count, f.hrr_vector, f.source, f.agent_id, f.run_id
        FROM facts f
        JOIN fact_entities fe ON f.fact_id = fe.fact_id
        JOIN entities e ON fe.entity_id = e.entity_id
@@ -556,7 +570,12 @@ function mapFactRow(row: FactRow): MemoryFact {
     tags: row.tags ?? "",
     trustScore: row.trust_score ?? 0,
     retrievalCount: row.retrieval_count ?? 0,
-    helpfulCount: row.helpful_count ?? 0
+    helpfulCount: row.helpful_count ?? 0,
+    // Explicit null (not undefined) for unset provenance — matches
+    // SQLite NULL so consumers can `fact.source === null` unambiguously.
+    source: row.source ?? null,
+    agentId: row.agent_id ?? null,
+    runId: row.run_id ?? null
   };
 
   if (typeof row.score === "number") {
@@ -602,6 +621,12 @@ function isUniqueConstraintError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const code = (error as { code?: string }).code;
   return code === "SQLITE_CONSTRAINT_UNIQUE" || code === "SQLITE_CONSTRAINT";
+}
+
+function normalizeProvenance(value: string | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 function normalizeTags(tags: string | string[] | undefined): string {
