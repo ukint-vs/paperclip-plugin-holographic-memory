@@ -31,8 +31,9 @@ interface CategoryPattern {
   patterns: RegExp[];
 }
 
-// Patterns ported verbatim from
-// ~/.hermes/hermes-agent/plugins/memory/holographic/__init__.py:359-371.
+// Patterns ported verbatim from Hermes' `_auto_extract_facts` in
+// ~/.hermes/hermes-agent/plugins/memory/holographic/__init__.py
+// (the two pattern blocks above the `for msg in messages` loop).
 // Keep this list locked to Hermes parity — adding patterns is a separate
 // PR that needs its own quality review.
 const CATEGORY_PATTERNS: CategoryPattern[] = [

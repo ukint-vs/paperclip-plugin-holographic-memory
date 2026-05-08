@@ -9,7 +9,6 @@ import {
   buildToolDescription,
   dispatchAction,
   extractRunFields,
-  extractRunStartedFields,
   handleRunFinished,
   handleRunStarted
 } from "../src/worker.js";
@@ -383,7 +382,7 @@ describe("ACTION_HANDLERS shape (D6)", () => {
   });
 });
 
-describe("extractRunStartedFields", () => {
+describe("extractRunFields", () => {
   it("unwraps a realistic PluginEvent shape (entityId/actorId at top level)", () => {
     // Mirrors the SDK's `PluginEvent<TPayload>` shape used by the host
     // when emitting `agent.run.started` events.
@@ -399,7 +398,7 @@ describe("extractRunStartedFields", () => {
       payload: { issueId: "issue-from-payload" }
     };
 
-    expect(extractRunStartedFields(sdkEvent)).toEqual({
+    expect(extractRunFields(sdkEvent)).toEqual({
       runId: "run-from-sdk",
       agentId: "agent-from-sdk",
       issueId: "issue-from-payload",
@@ -409,7 +408,7 @@ describe("extractRunStartedFields", () => {
 
   it("falls back to flat duck-typed shape used in tests", () => {
     const flat = { runId: "r1", agentId: "a1", issueId: "i1" };
-    expect(extractRunStartedFields(flat)).toEqual(flat);
+    expect(extractRunFields(flat)).toEqual(flat);
   });
 
   it("prefers SDK top-level fields over payload fields when both are present", () => {
@@ -420,7 +419,7 @@ describe("extractRunStartedFields", () => {
       actorId: "agent-canonical",
       payload: { runId: "run-shadowed", agentId: "agent-shadowed", issueId: "issue-payload" }
     };
-    expect(extractRunStartedFields(event)).toEqual({
+    expect(extractRunFields(event)).toEqual({
       runId: "run-canonical",
       agentId: "agent-canonical",
       issueId: "issue-payload"
@@ -429,16 +428,16 @@ describe("extractRunStartedFields", () => {
 
   it("omits undefined keys when fields are missing (no { runId: undefined } leak)", () => {
     const minimal = { payload: { issueId: "only-issue" } };
-    const out = extractRunStartedFields(minimal);
+    const out = extractRunFields(minimal);
     expect(out).toEqual({ issueId: "only-issue" });
     expect("runId" in out).toBe(false);
     expect("agentId" in out).toBe(false);
   });
 
   it("returns an empty object for null / undefined / empty input", () => {
-    expect(extractRunStartedFields(null)).toEqual({});
-    expect(extractRunStartedFields(undefined)).toEqual({});
-    expect(extractRunStartedFields({})).toEqual({});
+    expect(extractRunFields(null)).toEqual({});
+    expect(extractRunFields(undefined)).toEqual({});
+    expect(extractRunFields({})).toEqual({});
   });
 });
 
@@ -850,7 +849,7 @@ describe("handleRunFinished — auto-extract on agent.run.finished (#11)", () =>
   });
 });
 
-describe("extractRunFields (renamed from extractRunStartedFields, +startedAt/finishedAt)", () => {
+describe("extractRunFields — startedAt/finishedAt extraction", () => {
   it("pulls startedAt/finishedAt from payload", () => {
     const event = {
       eventType: "agent.run.finished",

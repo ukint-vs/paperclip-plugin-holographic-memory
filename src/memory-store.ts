@@ -358,30 +358,23 @@ export class MemoryStore {
       (this.db.prepare("PRAGMA table_info(facts)").all() as { name: string }[]).map((column) => column.name)
     );
 
-    if (!columns.has("helpful_count")) {
-      this.db.prepare("ALTER TABLE facts ADD COLUMN helpful_count INTEGER DEFAULT 0").run();
-    }
+    // Idempotent column-add: PRAGMA-checked, ALTER only when missing.
+    // The provenance trio (source/agent_id/run_id) ships with #11; the
+    // helpful_count/hrr_vector pair predates this PR. All five collapse
+    // into a single migration once the real framework (#9) lands.
+    const addColumnIfMissing = (name: string, type: string): void => {
+      if (!columns.has(name)) {
+        this.db.prepare(`ALTER TABLE facts ADD COLUMN ${name} ${type}`).run();
+      }
+    };
 
-    if (!columns.has("hrr_vector")) {
-      this.db.prepare("ALTER TABLE facts ADD COLUMN hrr_vector BLOB").run();
-    }
-
-    // Provenance shim (#11 / D11). Idempotent: PRAGMA-checked, ADD COLUMN
-    // only when missing. Auto-extracted facts populate these; curator/agent
-    // writes leave them NULL. Replaced by the real migration framework
-    // (#9) when that lands — at which point this block becomes the
-    // initial migration and `migrate()` shrinks back to one exec.
-    if (!columns.has("source")) {
-      this.db.prepare("ALTER TABLE facts ADD COLUMN source TEXT").run();
-    }
-
-    if (!columns.has("agent_id")) {
-      this.db.prepare("ALTER TABLE facts ADD COLUMN agent_id TEXT").run();
-    }
-
-    if (!columns.has("run_id")) {
-      this.db.prepare("ALTER TABLE facts ADD COLUMN run_id TEXT").run();
-    }
+    addColumnIfMissing("helpful_count", "INTEGER DEFAULT 0");
+    addColumnIfMissing("hrr_vector", "BLOB");
+    // Provenance shim (#11 / D11). Auto-extracted facts populate these;
+    // curator/agent writes leave them NULL.
+    addColumnIfMissing("source", "TEXT");
+    addColumnIfMissing("agent_id", "TEXT");
+    addColumnIfMissing("run_id", "TEXT");
   }
 
   private searchFts(query: string, limit: number, minTrust: number): ScorableFact[] {

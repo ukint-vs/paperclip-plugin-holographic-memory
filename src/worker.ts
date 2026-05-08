@@ -124,11 +124,6 @@ export function extractRunFields(event: any): AgentRunEvent {
   return fields;
 }
 
-// Back-compat re-export. Existing callers (and the test suite) reference
-// `extractRunStartedFields` directly; keep the alias rather than churn
-// every call site. New code should use `extractRunFields`.
-export const extractRunStartedFields = extractRunFields;
-
 export async function handleRunStarted(
   ctx: any,
   event: AgentRunEvent,
@@ -218,11 +213,15 @@ export async function handleRunFinished(
   if (!event.issueId) {
     return undefined;
   }
+  // Hoisted once; reused in every log line so a future placeholder change
+  // (e.g. switching to runId) only happens in one place.
+  const runLabel = event.runId ?? "<unknown>";
+
   if (!event.startedAt || !event.finishedAt) {
     // Fail closed: without honest timestamps we cannot attribute facts
     // to this run, so we'd rather skip than write a misleading run_id.
     ctx.logger?.warn?.(
-      `auto-extract: run ${event.runId ?? "<unknown>"} missing startedAt/finishedAt, skipping`
+      `auto-extract: run ${runLabel} missing startedAt/finishedAt, skipping`
     );
     return undefined;
   }
@@ -236,19 +235,23 @@ export async function handleRunFinished(
 
   if (Number.isNaN(startedAtMs) || Number.isNaN(finishedAtMs)) {
     ctx.logger?.warn?.(
-      `auto-extract: run ${runId ?? "<unknown>"} has unparseable startedAt/finishedAt, skipping`
+      `auto-extract: run ${runLabel} has unparseable startedAt/finishedAt, skipping`
     );
     return undefined;
   }
 
   try {
-    const issue = await ctx.issues?.get?.(issueId, companyId);
+    // issues.get and listComments are independent — fetch in parallel
+    // so the handler pays max(get, listComments) rather than sum.
+    const [issue, rawComments] = await Promise.all([
+      ctx.issues?.get?.(issueId, companyId),
+      ctx.issues?.listComments?.(issueId, companyId)
+    ]);
     const bodyText = [issue?.title, issue?.description, issue?.body]
       .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
       .join("\n");
 
-    const rawComments = (await ctx.issues?.listComments?.(issueId, companyId)) ?? [];
-    const filteredComments = rawComments.filter((comment: any) => {
+    const filteredComments = (rawComments ?? []).filter((comment: any) => {
       // D12: only humans. Agent comments saying "I prefer X" are
       // self-talk, not user preferences. authorUserId presence is the
       // canonical "human authored" signal in the SDK shape.
@@ -292,11 +295,13 @@ export async function handleRunFinished(
           const result = store.addFact(fact);
           if (result.inserted) insertedCount += 1;
         } catch (err) {
-          // Inner catch (Hermes line 380): one bad insertion (e.g.
-          // SQLite lock race) must not abort the loop. Logged for
-          // diagnostics; not rethrown.
+          // Inner catch — mirrors Hermes' on_session_end pattern in
+          // ~/.hermes/hermes-agent/plugins/memory/holographic/__init__.py
+          // (the `_auto_extract_facts` try/except around add_fact): one
+          // bad insertion (e.g. SQLite lock race) must not abort the
+          // loop. Logged for diagnostics; not rethrown.
           ctx.logger?.warn?.(
-            `auto-extract: addFact failed in run ${runId ?? "<unknown>"}`,
+            `auto-extract: addFact failed in run ${runLabel}`,
             err
           );
         }
@@ -304,7 +309,7 @@ export async function handleRunFinished(
     }
 
     ctx.logger?.info?.(
-      `auto-extract: issue ${issueId} run ${runId ?? "<unknown>"} → inserted ${insertedCount} facts`
+      `auto-extract: issue ${issueId} run ${runLabel} → inserted ${insertedCount} facts`
     );
     return { inserted: insertedCount };
   } catch (err) {
@@ -312,7 +317,7 @@ export async function handleRunFinished(
     // listComments must not throw out of an SDK event handler. Log and
     // exit cleanly — the next run.finished will retry naturally.
     ctx.logger?.error?.(
-      `auto-extract: failed for run ${runId ?? "<unknown>"}`,
+      `auto-extract: failed for run ${runLabel}`,
       err
     );
     return undefined;
