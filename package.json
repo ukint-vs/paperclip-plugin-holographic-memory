@@ -54,7 +54,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@paperclipai/plugin-sdk": "latest",
+    "@paperclipai/plugin-sdk": "^2026.428.0",
     "better-sqlite3": "^11.10.0",
     "react": "^19.0.0"
   },

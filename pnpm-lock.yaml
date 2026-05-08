@@ -9,7 +9,7 @@ importers:
   .:
     dependencies:
       '@paperclipai/plugin-sdk':
-        specifier: latest
+        specifier: ^2026.428.0
         version: 2026.428.0(react@19.2.6)
       better-sqlite3:
         specifier: ^11.10.0
