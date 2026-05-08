@@ -105,6 +105,97 @@ extracts completed issue resolutions, recurring run errors, agent capability
 notes, and workflow decisions. It writes facts with `paperclip:*` categories and
 deduplicates by content.
 
+## Using with `claude_local` and `codex_local` agents
+
+In-process Paperclip agents see the tool through `ctx.tools.register()`.
+Subprocess-based adapters (`claude_local` spawning `claude --print`,
+`codex_local` spawning `codex`) do not — the SDK's tool RPC is invisible to
+those external CLIs. To bridge them, this package ships a standalone MCP
+stdio server (`paperclip-holographic-memory-mcp`) that wraps the same SQLite
+store, plus a setup script that registers it in your Claude Code and Codex
+MCP configs. See `issue #20` for the architectural rationale.
+
+```text
+                         READ + RECALL_CONTEXT (cached)
++-----------------+      +-----------------+      +---------------+
+| Paperclip       | ---> | worker.ts       | ---> | MemoryStore   |
+| agent.run       |      | (in-process)    |      | WAL+busy_to   |
+| started         |      | ctx.state.set() |      | hermes-memory |
++-----------------+      |   + cache file  |      |     .db       |
+         |               +-----------------+      +---------------+
+         v                       |                        ^ ^
++-----------------+      +---------------------+          | |
+| claude_local    |      | recall-cache/       |          | |
+| spawns claude   |      |   run/<runId>.json  |          | |
+| --print         |      |   issue/<id>.json   |          | |
++-----------------+      |   agent/<id>.json   |          | |
+         |               +---------------------+          | |
+         v                       ^                        | |
++-----------------+               |                       | |
+| mcp-server.js   | ---reads cache+--                     | |
+| stdio transport | ----------------- WRITER + READER ----+ |
+| (per-spawn)     |                                         |
++-----------------+                                         |
+         ^                                                  |
++-----------------+                                         |
+| codex_local     | -----------------------------------------+
++-----------------+
+```
+
+### One-time setup
+
+```bash
+pnpm setup:mcp                  # merges entries into ~/.claude + ~/.codex
+pnpm setup:mcp --dry-run        # preview without writing
+pnpm setup:mcp --print          # emit snippets to stdout for manual paste
+pnpm setup:mcp --refresh        # rewrite entries (e.g. after dbPath change)
+pnpm setup:mcp --scope claude   # claude only; also: --scope codex
+```
+
+The script:
+
+- Creates `~/.claude/settings.json` or `~/.codex/config.toml` if missing (mode `0600`).
+- Backs up to `.bak` before any write.
+- Aborts with exit code 2 if either file is malformed (never overwrites broken state).
+- Is idempotent: re-running with the same flags is a no-op.
+- Preserves comments in `~/.codex/config.toml` by appending a marker block,
+  not by round-tripping through a TOML parser.
+
+After setup, restart Claude Code (or Codex) and the
+`mcp__holographic-memory__holographic_memory_search` tool will be available.
+
+### MCP server configuration
+
+The setup script writes these env vars into the MCP entry. Override via flags
+or by editing the generated config:
+
+| Var | Default | Purpose |
+|---|---|---|
+| `PAPERCLIP_HOLO_MEMORY_DB` | `~/.paperclip/instances/default/hermes-memory.db` | Same DB the worker uses |
+| `PAPERCLIP_HOLO_MEMORY_RECALL_ENABLED` | `true` | Read-action gate |
+| `PAPERCLIP_HOLO_MEMORY_RETAIN_ENABLED` | `true` | Write-action gate (intentional opt-in: MCP-mode users explicitly wired this in) |
+| `PAPERCLIP_HOLO_MEMORY_MIN_TRUST` | `0.3` | minTrustScore |
+| `PAPERCLIP_HOLO_MEMORY_MAX_RECALL` | `10` | maxFactsPerRecall |
+
+### Cross-process recall
+
+The worker writes recall-cache files to
+`<dirname(dbPath)>/recall-cache/{run,issue,agent}/<id>.json` on
+`agent.run.started`. The standalone MCP server reads these when the agent
+calls `recall_context` with `run_id`/`issue_id`/`agent_id` set, so
+claude_local/codex_local agents can still resolve pre-fetched memory.
+Without an explicit ID, `recall_context` returns
+`{ mode: "standalone", cached: false }` and the agent should call
+`action: "search"` instead. Stale cache files are GC'd after 24h.
+
+### Limitations
+
+- **dbPath drift**: if you change `dbPath` in Paperclip Settings, re-run
+  `pnpm setup:mcp --refresh` so the MCP server's env stays in sync.
+- **Concurrent writers**: SQLite WAL serializes writers; `busy_timeout=5000`
+  is set so contended writes wait up to 5s for the lock. Single-user dev
+  profiles never hit this; CI farms running many concurrent agents might.
+
 ## Agent tool
 
 `holographic_memory_search`
