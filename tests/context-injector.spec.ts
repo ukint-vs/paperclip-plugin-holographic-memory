@@ -8,7 +8,8 @@ const fact: MemoryFact = {
   category: "project",
   tags: "paperclip,memory",
   trustScore: 0.75,
-  retrievalCount: 0
+  retrievalCount: 0,
+  helpfulCount: 0
 };
 
 describe("context formatting", () => {

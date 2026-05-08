@@ -2,7 +2,16 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { bundle, bytesToPhases, DEFAULT_HRR_DIM, encodeAtom, encodeFact, encodeText, phasesToBytes, similarity, unbind } from "./hrr.js";
-import type { AddFactResult, FactFeedbackResult, MemoryFact, MemorySearchOptions, NewMemoryFact } from "./types.js";
+import type {
+  AddFactResult,
+  FactFeedbackResult,
+  MemoryFact,
+  MemorySearchOptions,
+  NewMemoryFact,
+  RemoveFactResult,
+  UpdateFactPartial,
+  UpdateFactResult
+} from "./types.js";
 
 interface FactRow {
   fact_id: number;
@@ -14,6 +23,14 @@ interface FactRow {
   helpful_count: number | null;
   hrr_vector?: Buffer | null;
   score?: number;
+  fts_rank_raw?: number | null;
+}
+
+// Internal scoring shape — vector + raw FTS rank carried through the
+// search pipeline, stripped before results leave the store.
+interface ScorableFact extends MemoryFact {
+  hrrVector?: Float64Array;
+  ftsRankRaw?: number;
 }
 
 interface MemoryStoreOptions {
@@ -50,25 +67,41 @@ export class MemoryStore {
     const remaining = Math.max(0, limit * 3 - byText.length);
 
     const byEntity = this.searchEntities(query, remaining, minTrust);
-    const merged = new Map<number, MemoryFact>();
+    // FTS branch wins on collision: it carries both the vector and the rank.
+    const merged = new Map<number, ScorableFact>();
+    for (const fact of byEntity) merged.set(fact.factId, fact);
+    for (const fact of byText) merged.set(fact.factId, fact);
 
-    for (const fact of [...byText, ...byEntity]) {
-      merged.set(fact.factId, fact);
-    }
+    // Normalize FTS rank across the candidate batch. FTS5 rank is negative
+    // (lower = better); abs(rank)/maxAbs produces [0, 1] where best = 1.
+    // 1e-6 floor prevents NaN when only entity-branch hits (no rank) exist.
+    const candidates = [...merged.values()];
+    const maxAbsRank = Math.max(
+      ...candidates.map((c) => Math.abs(c.ftsRankRaw ?? 0)),
+      1e-6
+    );
+    const ftsLookup = (fact: ScorableFact): number =>
+      fact.ftsRankRaw == null ? 0 : Math.abs(fact.ftsRankRaw) / maxAbsRank;
 
     const queryTokens = tokenize(query);
     const queryVector = this.hrrEnabled ? encodeText(query, this.hrrDim) : undefined;
-    const results = [...merged.values()]
-      .map((fact) => scoreFact(fact, queryTokens, queryVector))
+
+    const scored = candidates
+      .map((fact) => scoreFact(fact, queryTokens, queryVector, ftsLookup))
       .sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || b.trustScore - a.trustScore || a.factId - b.factId)
       .slice(0, limit);
 
-    this.incrementRetrievalCounts(results.map((fact) => fact.factId));
-    return results;
+    this.incrementRetrievalCounts(scored.map((fact) => fact.factId));
+    return scored.map(stripScoringFields);
   }
 
   close(): void {
     this.db.close();
+  }
+
+  countFacts(): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS n FROM facts").get() as { n: number };
+    return row?.n ?? 0;
   }
 
   addFact(fact: NewMemoryFact): AddFactResult {
@@ -78,31 +111,130 @@ export class MemoryStore {
       throw new Error("Cannot add an empty memory fact");
     }
 
-    const existing = this.db.prepare("SELECT fact_id FROM facts WHERE content = ?").get(content) as
-      | { fact_id: number }
-      | undefined;
     const tags = normalizeTags(fact.tags);
     const category = fact.category?.trim() || "general";
     const trustScore = normalizeTrust(fact.trustScore);
 
-    if (existing) {
-      return { factId: existing.fact_id, inserted: false };
-    }
+    const run = this.db.transaction((): AddFactResult => {
+      const existing = this.db.prepare("SELECT fact_id FROM facts WHERE content = ?").get(content) as
+        | { fact_id: number }
+        | undefined;
 
-    const result = this.db
-      .prepare("INSERT INTO facts (content, category, tags, trust_score) VALUES (?, ?, ?, ?)")
-      .run(content, category, tags, trustScore);
-    const factId = Number(result.lastInsertRowid);
-    const entities = extractEntities(content);
+      if (existing) {
+        return { factId: existing.fact_id, inserted: false };
+      }
 
-    for (const entity of entities) {
-      const entityId = this.resolveEntity(entity);
-      this.linkFactEntity(factId, entityId);
-    }
+      const result = this.db
+        .prepare("INSERT INTO facts (content, category, tags, trust_score) VALUES (?, ?, ?, ?)")
+        .run(content, category, tags, trustScore);
+      const factId = Number(result.lastInsertRowid);
+      const entities = extractEntities(content);
 
-    this.computeHrrVector(factId, content, entities);
-    this.rebuildBank(category);
-    return { factId, inserted: true };
+      for (const entity of entities) {
+        const entityId = this.resolveEntity(entity);
+        this.linkFactEntity(factId, entityId);
+      }
+
+      this.computeHrrVector(factId, content, entities);
+      this.rebuildBank(category);
+      return { factId, inserted: true };
+    });
+
+    return run();
+  }
+
+  updateFact(factId: number, partial: UpdateFactPartial): UpdateFactResult {
+    const run = this.db.transaction((): UpdateFactResult => {
+      const row = this.db
+        .prepare("SELECT fact_id, category, trust_score FROM facts WHERE fact_id = ?")
+        .get(factId) as { fact_id: number; category: string; trust_score: number } | undefined;
+
+      if (!row) {
+        return { updated: false, reason: "not_found" };
+      }
+
+      const oldCategory = row.category ?? "general";
+      const newContent = typeof partial.content === "string" ? partial.content.trim() : undefined;
+      const contentChanged = newContent !== undefined && newContent.length > 0;
+      const newCategory = partial.category?.trim();
+      const categoryChanged = typeof newCategory === "string" && newCategory.length > 0 && newCategory !== oldCategory;
+      const newTags = partial.tags === undefined ? undefined : normalizeTags(partial.tags);
+      const newTrust =
+        typeof partial.trustDelta === "number" && !Number.isNaN(partial.trustDelta)
+          ? normalizeTrust(row.trust_score + partial.trustDelta)
+          : undefined;
+
+      const sets: string[] = ["updated_at = CURRENT_TIMESTAMP"];
+      const params: unknown[] = [];
+
+      if (contentChanged) {
+        sets.push("content = ?");
+        params.push(newContent!);
+      }
+      if (categoryChanged) {
+        sets.push("category = ?");
+        params.push(newCategory!);
+      }
+      if (newTags !== undefined) {
+        sets.push("tags = ?");
+        params.push(newTags);
+      }
+      if (newTrust !== undefined) {
+        sets.push("trust_score = ?");
+        params.push(newTrust);
+      }
+
+      params.push(factId);
+
+      try {
+        this.db.prepare(`UPDATE facts SET ${sets.join(", ")} WHERE fact_id = ?`).run(...params);
+      } catch (error) {
+        if (isUniqueConstraintError(error)) {
+          return { updated: false, reason: "duplicate_content" };
+        }
+        throw error;
+      }
+
+      const finalCategory = categoryChanged ? newCategory! : oldCategory;
+
+      if (contentChanged) {
+        this.db.prepare("DELETE FROM fact_entities WHERE fact_id = ?").run(factId);
+        const entities = extractEntities(newContent!);
+        for (const entity of entities) {
+          const entityId = this.resolveEntity(entity);
+          this.linkFactEntity(factId, entityId);
+        }
+        this.computeHrrVector(factId, newContent!, entities);
+      }
+
+      if (contentChanged || categoryChanged) {
+        if (categoryChanged) this.rebuildBank(oldCategory);
+        this.rebuildBank(finalCategory);
+      }
+
+      return { updated: true };
+    });
+
+    return run();
+  }
+
+  removeFact(factId: number): RemoveFactResult {
+    const run = this.db.transaction((): RemoveFactResult => {
+      const row = this.db.prepare("SELECT fact_id, category FROM facts WHERE fact_id = ?").get(factId) as
+        | { fact_id: number; category: string }
+        | undefined;
+
+      if (!row) {
+        return { removed: false };
+      }
+
+      this.db.prepare("DELETE FROM fact_entities WHERE fact_id = ?").run(factId);
+      this.db.prepare("DELETE FROM facts WHERE fact_id = ?").run(factId);
+      this.rebuildBank(row.category ?? "general");
+      return { removed: true };
+    });
+
+    return run();
   }
 
   probe(entity: string, options: MemorySearchOptions = {}): MemoryFact[] {
@@ -227,11 +359,11 @@ export class MemoryStore {
     }
   }
 
-  private searchFts(query: string, limit: number, minTrust: number): MemoryFact[] {
+  private searchFts(query: string, limit: number, minTrust: number): ScorableFact[] {
     const rows = this.db
       .prepare(
         `SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score, f.retrieval_count,
-                f.helpful_count, f.hrr_vector
+                f.helpful_count, f.hrr_vector, facts_fts.rank AS fts_rank_raw
          FROM facts_fts
          JOIN facts f ON facts_fts.rowid = f.fact_id
          WHERE facts_fts MATCH ?
@@ -241,17 +373,17 @@ export class MemoryStore {
       )
       .all(query, minTrust, limit) as FactRow[];
 
-    return rows.map(mapFactRow);
+    return rows.map(mapFactRowWithVector);
   }
 
-  private searchEntities(query: string, limit: number, minTrust: number): MemoryFact[] {
+  private searchEntities(query: string, limit: number, minTrust: number): ScorableFact[] {
     const terms = extractEntityTerms(query);
 
     if (!terms.length) {
       return [];
     }
 
-    const results = new Map<number, MemoryFact>();
+    const results = new Map<number, ScorableFact>();
     const stmt = this.db.prepare(
       `SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score, f.retrieval_count,
               f.helpful_count, f.hrr_vector
@@ -269,7 +401,7 @@ export class MemoryStore {
       const rows = stmt.all(pattern, pattern, minTrust, limit) as FactRow[];
 
       for (const row of rows) {
-        results.set(row.fact_id, mapFactRow(row));
+        results.set(row.fact_id, mapFactRowWithVector(row));
       }
     }
 
@@ -428,6 +560,22 @@ function mapFactRow(row: FactRow): MemoryFact {
   return fact;
 }
 
+function mapFactRowWithVector(row: FactRow): ScorableFact {
+  const fact: ScorableFact = mapFactRow(row);
+  if (row.hrr_vector) {
+    fact.hrrVector = bytesToPhases(row.hrr_vector);
+  }
+  if (typeof row.fts_rank_raw === "number") {
+    fact.ftsRankRaw = row.fts_rank_raw;
+  }
+  return fact;
+}
+
+function stripScoringFields(scorable: ScorableFact): MemoryFact {
+  const { hrrVector: _v, ftsRankRaw: _r, ...rest } = scorable;
+  return rest;
+}
+
 function normalizeLimit(value: number | undefined): number {
   if (typeof value !== "number" || Number.isNaN(value)) {
     return 5;
@@ -442,6 +590,12 @@ function normalizeTrust(value: number | undefined): number {
   }
 
   return Math.max(0, Math.min(1, value));
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as { code?: string }).code;
+  return code === "SQLITE_CONSTRAINT_UNIQUE" || code === "SQLITE_CONSTRAINT";
 }
 
 function normalizeTags(tags: string | string[] | undefined): string {
@@ -525,15 +679,31 @@ function tokenize(text: string): Set<string> {
   );
 }
 
-function scoreFact(fact: MemoryFact, queryTokens: Set<string>, queryVector?: Float64Array): MemoryFact {
+// Hermes-aligned blend: 40% FTS rank + 30% Jaccard + 30% HRR similarity,
+// then weighted by trust. Mirrors retrieval.py:91-94 in the Hermes plugin.
+//
+// TODO(hrr-unbind-variant): Stored fact vectors come from `encodeFact`,
+// which binds content to `__hrr_role_content__`. We're comparing a raw
+// `encodeText(query)` to the bundled fact vector — strictly the math
+// would prefer `similarity(qVec, unbind(fact.hrrVector, role_content))`.
+// Hermes does the raw form too; revisit once we have real recall data.
+function scoreFact(
+  fact: ScorableFact,
+  queryTokens: Set<string>,
+  queryVector: Float64Array | undefined,
+  ftsLookup: (fact: ScorableFact) => number
+): ScorableFact {
   const factTokens = tokenize(`${fact.content} ${fact.tags}`);
   const overlap = [...queryTokens].filter((token) => factTokens.has(token)).length;
   const union = new Set([...queryTokens, ...factTokens]).size || 1;
   const jaccard = overlap / union;
-  const relevance = queryVector ? 0.7 * jaccard + 0.3 * 0.5 : jaccard;
 
-  return {
-    ...fact,
-    score: relevance * fact.trustScore
-  };
+  const hrr =
+    queryVector && fact.hrrVector
+      ? (similarity(queryVector, fact.hrrVector) + 1) / 2
+      : 0.5;
+  const fts = ftsLookup(fact);
+  const relevance = 0.4 * fts + 0.3 * jaccard + 0.3 * hrr;
+
+  return { ...fact, score: relevance * fact.trustScore };
 }
