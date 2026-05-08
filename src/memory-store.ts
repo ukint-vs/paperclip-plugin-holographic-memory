@@ -404,7 +404,7 @@ export class MemoryStore {
     const results = new Map<number, ScorableFact>();
     const stmt = this.db.prepare(
       `SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score, f.retrieval_count,
-              f.helpful_count, f.hrr_vector
+              f.helpful_count, f.hrr_vector, f.source, f.agent_id, f.run_id
        FROM facts f
        JOIN fact_entities fe ON f.fact_id = fe.fact_id
        JOIN entities e ON fe.entity_id = e.entity_id
