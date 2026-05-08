@@ -6,7 +6,7 @@
   "main": "dist/worker.js",
   "types": "dist/worker.d.ts",
   "paperclipPlugin": {
-    "manifest": "./dist/manifest.js",
+    "manifest": "./manifest.cjs",
     "worker": "./dist/worker.js"
   },
   "files": [
@@ -17,7 +17,7 @@
     "package.json"
   ],
   "scripts": {
-    "build": "tsup src/worker.ts src/manifest.ts src/ui/index.tsx --format esm --dts --clean",
+    "build": "tsup src/worker.ts src/manifest.ts src/ui/index.tsx --format esm --dts --clean && node -e \"import('./dist/manifest.js').then(m => require('fs').writeFileSync('manifest.json', JSON.stringify(m.default, null, 2)))\"",
     "seed:paperclip": "tsx scripts/seed-from-paperclip.ts",
     "import:facts": "tsx scripts/import-facts.ts",
     "typecheck": "tsc --noEmit",

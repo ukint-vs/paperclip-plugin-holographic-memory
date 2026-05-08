@@ -1,4 +1,4 @@
-import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
+import { definePlugin, startWorkerRpcHost } from "@paperclipai/plugin-sdk";
 import type { ScopeKey, ToolResult, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { formatFactsAsText, formatFactsForPrompt } from "./context-injector.js";
 import { resolvePluginConfig } from "./config.js";
@@ -77,7 +77,7 @@ const plugin = definePlugin({
 });
 
 export default plugin;
-runWorker(plugin, import.meta.url);
+startWorkerRpcHost({ plugin });
 
 export function extractRunStartedFields(event: any): AgentRunStartedEvent {
   // PluginEvent gives us companyId/actorId/entityId at the top level and a
