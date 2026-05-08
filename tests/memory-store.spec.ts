@@ -309,6 +309,118 @@ describe("MemoryStore", () => {
     });
   });
 
+  describe("provenance columns (#11 / D11)", () => {
+    it("schema shim is idempotent on a fresh DB (open twice)", () => {
+      const dbPath = tempDbPath();
+      const a = new MemoryStore(dbPath);
+      a.addFact({ content: "first" });
+      a.close();
+
+      // Second open re-runs migrate() — must not throw or duplicate columns.
+      const b = new MemoryStore(dbPath);
+      stores.push(b);
+      expect(b.countFacts()).toBe(1);
+
+      const db = new Database(dbPath);
+      dbs.push(db);
+      const cols = (db.prepare("PRAGMA table_info(facts)").all() as { name: string }[]).map(
+        (c) => c.name
+      );
+      // Each provenance column appears exactly once.
+      expect(cols.filter((c) => c === "source")).toHaveLength(1);
+      expect(cols.filter((c) => c === "agent_id")).toHaveLength(1);
+      expect(cols.filter((c) => c === "run_id")).toHaveLength(1);
+    });
+
+    it("schema shim adds columns to an existing DB created without them", () => {
+      const dbPath = tempDbPath();
+      // Pre-create the facts table WITHOUT the new columns to simulate
+      // an older schema in the wild.
+      const seed = new Database(dbPath);
+      seed.exec(`
+        CREATE TABLE facts (
+          fact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          content TEXT NOT NULL UNIQUE,
+          category TEXT DEFAULT 'general',
+          tags TEXT DEFAULT '',
+          trust_score REAL DEFAULT 0.5,
+          retrieval_count INTEGER DEFAULT 0,
+          helpful_count INTEGER DEFAULT 0,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          hrr_vector BLOB
+        );
+        INSERT INTO facts (content) VALUES ('legacy fact');
+      `);
+      seed.close();
+
+      // Opening the store runs migrate(), which should add the missing
+      // provenance columns via ALTER TABLE.
+      const store = new MemoryStore(dbPath);
+      stores.push(store);
+
+      const db = new Database(dbPath);
+      dbs.push(db);
+      const cols = new Set(
+        (db.prepare("PRAGMA table_info(facts)").all() as { name: string }[]).map((c) => c.name)
+      );
+      expect(cols.has("source")).toBe(true);
+      expect(cols.has("agent_id")).toBe(true);
+      expect(cols.has("run_id")).toBe(true);
+    });
+
+    it("addFact persists source/agentId/runId and search round-trips them", () => {
+      const store = freshStore();
+      store.addFact({
+        content: "auto-fact with provenance",
+        category: "project",
+        trustScore: 0.5,
+        source: "auto",
+        agentId: "agent-77",
+        runId: "run-77"
+      });
+
+      const [hit] = store.search("auto-fact", { limit: 1, minTrust: 0 });
+      expect(hit?.source).toBe("auto");
+      expect(hit?.agentId).toBe("agent-77");
+      expect(hit?.runId).toBe("run-77");
+    });
+
+    it("addFact without provenance fields leaves columns NULL (not undefined)", () => {
+      const store = freshStore();
+      store.addFact({ content: "curated fact, no provenance" });
+
+      const [hit] = store.listFacts({ limit: 1, minTrust: 0 });
+      // Explicit null check (C12): consumers can rely on `=== null`,
+      // not have to remember `=== undefined`.
+      expect(hit?.source).toBeNull();
+      expect(hit?.agentId).toBeNull();
+      expect(hit?.runId).toBeNull();
+    });
+
+    it("dedup on second addFact returns inserted:false even when provenance differs", () => {
+      // C8 relocation: dedup is a MemoryStore concern, not auto-extract.
+      const store = freshStore();
+      const first = store.addFact({
+        content: "we decided to use SQLite",
+        category: "project",
+        source: "auto",
+        agentId: "agent-1",
+        runId: "run-1"
+      });
+      const second = store.addFact({
+        content: "we decided to use SQLite",
+        category: "project",
+        source: "auto",
+        agentId: "agent-2",
+        runId: "run-2"
+      });
+      expect(first.inserted).toBe(true);
+      expect(second.inserted).toBe(false);
+      expect(second.factId).toBe(first.factId);
+    });
+  });
+
   describe("search HRR + FTS blend", () => {
     it("normalizes FTS rank without NaN when only entity branch hits exist", () => {
       const store = freshStore();
