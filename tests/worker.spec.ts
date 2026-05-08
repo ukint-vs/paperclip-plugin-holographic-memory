@@ -5,8 +5,12 @@ import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { handleRunStarted } from "../src/worker.js";
 
+function scopeKeyId(scope: { scopeKind: string; scopeId: string; namespace?: string; stateKey: string }): string {
+  return `${scope.scopeKind}:${scope.scopeId}:${scope.namespace ?? "default"}:${scope.stateKey}`;
+}
+
 describe("worker", () => {
-  it("stores recall state for started runs", async () => {
+  it("writes recall state under run/issue/agent scopes", async () => {
     const dbPath = createDb();
     const state = new Map<string, unknown>();
     const ctx = {
@@ -17,13 +21,14 @@ describe("worker", () => {
         })
       },
       state: {
-        set: async (key: string, value: unknown) => state.set(key, value)
+        set: async (scope: { scopeKind: string; scopeId: string; namespace?: string; stateKey: string }, value: unknown) =>
+          state.set(scopeKeyId(scope), value)
       }
     };
 
     const result = await handleRunStarted(
       ctx,
-      { issueId: "issue-1", runId: "run-1" },
+      { issueId: "issue-1", runId: "run-1", agentId: "agent-1" },
       {
         dbPath,
         recallEnabled: true,
@@ -35,7 +40,9 @@ describe("worker", () => {
 
     expect(result?.formatted).toContain("MEMORY CONTEXT:");
     expect(result?.formatted).toContain("Vara wallet supports IDL-aware calls");
-    expect(state.has("recall:run-1")).toBe(true);
+    expect(state.has("run:run-1:recall:context")).toBe(true);
+    expect(state.has("issue:issue-1:recall:context")).toBe(true);
+    expect(state.has("agent:agent-1:recall:context")).toBe(true);
   });
 });
 

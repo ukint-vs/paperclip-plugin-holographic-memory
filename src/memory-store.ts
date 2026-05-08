@@ -99,6 +99,11 @@ export class MemoryStore {
     this.db.close();
   }
 
+  countFacts(): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS n FROM facts").get() as { n: number };
+    return row?.n ?? 0;
+  }
+
   addFact(fact: NewMemoryFact): AddFactResult {
     const content = fact.content.trim();
 
