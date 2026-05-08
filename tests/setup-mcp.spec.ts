@@ -143,6 +143,26 @@ describe("mergeCodexConfig", () => {
     expect(outcome.output).toContain("[mcp_servers.holographic-memory]");
   });
 
+  it("does not false-match marker text inside a user-quoted comment", () => {
+    // Adversarial review caught this: indexOf would have found the marker
+    // string inside a user's own commented-out reference to it and stitched
+    // across user content. The anchored ^...$ regex with the m flag rejects
+    // anything that isn't a marker on its own line.
+    const userComment = [
+      "# Note: '# managed by paperclip-plugin-holographic-memory' is a marker",
+      'model = "gpt-5.5"',
+      "# end paperclip-plugin-holographic-memory should be left alone in this prose comment",
+      "",
+    ].join("\n");
+    const outcome = mergeCodexConfig(userComment, CODEX_BLOCK, false);
+    expect(outcome.changed).toBe(true);
+    // The user comment line must survive intact.
+    expect(outcome.output).toContain("# Note: '# managed by");
+    // Our managed block must be appended cleanly, not stitched into the comment.
+    expect(outcome.output).toContain("[mcp_servers.holographic-memory]");
+    expect(outcome.output.indexOf("# managed by paperclip-plugin-holographic-memory\n[mcp_servers")).toBeGreaterThan(0);
+  });
+
   it("production block contains all five env keys inline", () => {
     expect(CODEX_BLOCK).toContain("PAPERCLIP_HOLO_MEMORY_DB");
     expect(CODEX_BLOCK).toContain("PAPERCLIP_HOLO_MEMORY_RECALL_ENABLED");

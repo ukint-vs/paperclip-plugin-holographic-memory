@@ -120,6 +120,18 @@ describe("dispatchStandaloneAction — gates", () => {
     expect(result.content).toMatch(/retain is disabled/);
   });
 
+  it("feedback is gated by retainEnabled (mutates trust_score)", async () => {
+    // Codex caught this: feedback writes to the DB (trust_score / helpful_count
+    // / updated_at via MemoryStore.recordFeedback) but used to be classified
+    // as a read action. With retainEnabled=false the call must now be blocked.
+    const config = baseConfig(tempDb(), { retainEnabled: false });
+    const result = await dispatchStandaloneAction(
+      { action: "feedback", fact_id: 1, helpful: true },
+      config,
+    );
+    expect(result.content).toMatch(/retain is disabled/);
+  });
+
   it("unknown action returns error", async () => {
     const config = baseConfig(tempDb());
     const result = await dispatchStandaloneAction({ action: "bogus" }, config);

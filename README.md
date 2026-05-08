@@ -215,7 +215,6 @@ Read actions (gated by `recallEnabled`):
 - `related`: HRR-based entity adjacency.
 - `reason`: facts linked to all provided entities.
 - `list`: browse facts by trust/category (returns JSON).
-- `feedback`: update trust using `fact_id` and `helpful` (returns JSON).
 - `recall_context`: return the cached MEMORY CONTEXT for a run/issue/agent.
   Resolves explicit `run_id` / `issue_id` / `agent_id`, then falls back to
   the calling tool's `runCtx.runId` / `runCtx.agentId`, then to a live
@@ -230,6 +229,9 @@ Write actions (gated by `retainEnabled`, all return JSON):
   `fact_id`. Re-extracts entities and recomputes the HRR vector when content
   changes. Returns `{ updated: false, reason: "duplicate_content" }` on a
   content collision.
+- `feedback`: update trust using `fact_id` and `helpful` (returns JSON).
+  Mutates `trust_score`, `helpful_count`, and `updated_at` on the fact row,
+  so it is gated by `retainEnabled` alongside the other write actions.
 - `remove`: hard-delete by `fact_id`. Drops entity links and rebuilds the
   affected category bank.
 

@@ -49,10 +49,13 @@ export const READ_ACTIONS = new Set([
   "reason",
   "recall_context",
   "list",
-  "feedback"
 ]);
 
-export const WRITE_ACTIONS = new Set(["add", "update", "remove"]);
+// `feedback` mutates trust_score / helpful_count / updated_at on the fact row
+// (see MemoryStore.recordFeedback), so it belongs in the write set. Earlier
+// it was misclassified as read, which let agents persist trust changes even
+// when retainEnabled=false. README updated alongside.
+export const WRITE_ACTIONS = new Set(["add", "update", "remove", "feedback"]);
 
 export function err(message: string): DispatchToolResult {
   return { content: message, error: message };

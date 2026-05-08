@@ -50,6 +50,14 @@ function parseFlag<T>(argv: string[], name: string, parse: (raw: string) => T): 
   return parse(value);
 }
 
+// Accept the same boolean spellings the env-var parser in mcp-server.ts does
+// so `--recall 1` / `--recall yes` don't silently turn it off (the previous
+// `s === "true"` parser returned false for everything except "true").
+function parseBoolFlag(raw: string): boolean {
+  const v = raw.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+}
+
 function parseArgs(argv: string[]): CliOptions {
   const has = (name: string) => argv.includes(`--${name}`);
   const scopeRaw = parseFlag(argv, "scope", (s) => s) ?? "both";
@@ -66,8 +74,8 @@ function parseArgs(argv: string[]): CliOptions {
     refresh: has("refresh"),
     scope: scopeRaw as "claude" | "codex" | "both",
     dbPath,
-    recallEnabled: parseFlag(argv, "recall", (s) => s === "true") ?? true,
-    retainEnabled: parseFlag(argv, "retain", (s) => s === "true") ?? true,
+    recallEnabled: parseFlag(argv, "recall", parseBoolFlag) ?? true,
+    retainEnabled: parseFlag(argv, "retain", parseBoolFlag) ?? true,
     minTrust: parseFlag(argv, "min-trust", (s) => Number(s)) ?? 0.3,
     maxRecall: parseFlag(argv, "max-recall", (s) => Number(s)) ?? 10,
     command,
@@ -106,7 +114,30 @@ async function pathExists(target: string): Promise<boolean> {
 
 async function backup(target: string): Promise<void> {
   if (!(await pathExists(target))) return;
-  await fs.copyFile(target, `${target}.bak`);
+  // Preserve any existing .bak as .bak.prev so users keep a one-step recovery
+  // history. Without this, two consecutive `pnpm setup:mcp` runs (e.g. user
+  // edited config between them) overwrite the original-state .bak with the
+  // post-first-run state, destroying the only recovery point.
+  const bakPath = `${target}.bak`;
+  if (await pathExists(bakPath)) {
+    await fs.rename(bakPath, `${target}.bak.prev`).catch(() => undefined);
+  }
+  await fs.copyFile(target, bakPath);
+}
+
+// Resolve a path through any symlinks so we write to the real file, not
+// replace the symlink with a regular file. Dotfile managers (stow, chezmoi,
+// nix home-manager) put settings.json/config.toml as symlinks; the previous
+// implementation called fs.rename(tmp, target) which replaces the symlink
+// itself, silently disconnecting the dotfile repo from the live config.
+// Falls back to the original path when realpath fails (e.g. file doesn't
+// exist yet — atomicWrite will create it as a regular file).
+async function resolveTarget(target: string): Promise<string> {
+  try {
+    return await fs.realpath(target);
+  } catch {
+    return target;
+  }
 }
 
 interface MergeOutcome {
@@ -191,13 +222,29 @@ export function buildCodexBlock(opts: CliOptions): string {
   ].join("\n");
 }
 
+// Marker regexes are anchored to start-of-line (with the `m` flag) so we can't
+// false-positive match the literal marker text appearing inside a user's own
+// commented-out block. Otherwise an `indexOf` on `# managed by ...` would
+// pick up commented-out marker prose and stitch across user content.
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// `[ \t]*` (not `\s*`) for the trailing slack — `\s` matches newlines too,
+// which under the `m` flag would let the match consume past end-of-line and
+// throw off the slice boundary used to extract the existing block.
+const TOML_MARKER_BEGIN_RE = new RegExp(`^${escapeRegExp(TOML_MARKER_BEGIN)}[ \\t]*$`, "m");
+const TOML_MARKER_END_RE = new RegExp(`^${escapeRegExp(TOML_MARKER_END)}[ \\t]*$`, "m");
+
 export function mergeCodexConfig(existing: string, block: string, refresh: boolean): MergeOutcome {
-  const startIdx = existing.indexOf(TOML_MARKER_BEGIN);
-  const endIdx = existing.indexOf(TOML_MARKER_END);
-  if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+  const startMatch = TOML_MARKER_BEGIN_RE.exec(existing);
+  const endMatch = TOML_MARKER_END_RE.exec(existing);
+  if (startMatch && endMatch && endMatch.index > startMatch.index) {
+    const startIdx = startMatch.index;
+    const endIdx = endMatch.index + endMatch[0].length;
     const beforeBlock = existing.slice(0, startIdx);
-    const afterBlock = existing.slice(endIdx + TOML_MARKER_END.length);
-    const currentBlock = existing.slice(startIdx, endIdx + TOML_MARKER_END.length);
+    const afterBlock = existing.slice(endIdx);
+    const currentBlock = existing.slice(startIdx, endIdx);
     if (currentBlock === block && !refresh) {
       return { changed: false, reason: "[mcp_servers.holographic-memory] already up to date", output: existing };
     }
@@ -292,9 +339,15 @@ async function run(opts: CliOptions): Promise<number> {
       process.stdout.write(`---- ${target} (preview) ----\n${outcome.output}---- end preview ----\n`);
       continue;
     }
-    await backup(target);
-    await atomicWrite(target, outcome.output, 0o600);
-    process.stdout.write(`[${label}] ${target}: ${outcome.reason}; backup at ${target}.bak\n`);
+    // Resolve symlinks so we update the real file (the dotfile-repo source
+    // for stow / chezmoi / nix-home-manager users) instead of replacing the
+    // symlink with a regular file via fs.rename. Backup also operates on
+    // the resolved path so the .bak sits next to the real source.
+    const realTarget = await resolveTarget(target);
+    await backup(realTarget);
+    await atomicWrite(realTarget, outcome.output, 0o600);
+    const noteSuffix = realTarget !== target ? ` (resolved from ${target})` : "";
+    process.stdout.write(`[${label}] ${realTarget}${noteSuffix}: ${outcome.reason}; backup at ${realTarget}.bak\n`);
   }
 
   if (opts.dryRun && allClean) {

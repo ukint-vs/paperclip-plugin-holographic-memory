@@ -63,24 +63,41 @@ export function createServer(config: HolographicMemoryConfig = resolveStandalone
     },
     async (rawParams) => {
       const params = (rawParams ?? {}) as ToolParams;
-      const result = await dispatchStandaloneAction(params, config);
-      // Map our DispatchToolResult to the MCP CallToolResult shape: content
-      // is an array of typed parts. We pack the formatted text plus, when
-      // structured data is present, a JSON-serialized text block so agents
-      // that prefer parsed payloads (e.g. for action='list') can recover them.
-      const content: Array<{ type: "text"; text: string }> = [
-        { type: "text", text: result.content },
-      ];
-      if (result.data !== undefined) {
-        content.push({
-          type: "text",
-          text: `\n[data]\n${JSON.stringify(result.data)}`,
-        });
+      // Wrap in try/catch so handler-level exceptions (e.g. SQLITE errors
+      // when a fact_id doesn't exist) come back as a structured tool error
+      // the agent can branch on, instead of bubbling out as a JSON-RPC
+      // server error which most MCP clients render as an opaque failure.
+      try {
+        const result = await dispatchStandaloneAction(params, config);
+        // Map DispatchToolResult to the MCP CallToolResult shape: content is
+        // an array of typed parts. We pack the formatted text plus, when
+        // structured data is present, a JSON-serialized text block so agents
+        // that prefer parsed payloads (e.g. for action='list') can recover them.
+        const content: Array<{ type: "text"; text: string }> = [
+          { type: "text", text: result.content },
+        ];
+        if (result.data !== undefined) {
+          content.push({
+            type: "text",
+            text: `\n[data]\n${JSON.stringify(result.data)}`,
+          });
+        }
+        return {
+          content,
+          isError: Boolean(result.error),
+        };
+      } catch (error) {
+        const message = (error as Error).message;
+        return {
+          content: [
+            {
+              type: "text",
+              text: `holographic_memory_search error: ${message}`,
+            },
+          ],
+          isError: true,
+        };
       }
-      return {
-        content,
-        isError: Boolean(result.error),
-      };
     },
   );
 
@@ -94,13 +111,24 @@ async function main(): Promise<void> {
   // Best-effort cleanup on signals AND when the host disconnects stdio.
   // better-sqlite3 also auto-closes on process exit, but explicit closure
   // prevents stale .db-wal files from abrupt SIGKILL recovery cycles.
+  //
+  // Why this exit shape: the previous version called `setImmediate(process.exit)`
+  // which schedules the exit one tick later but does NOT drain stdout. Under
+  // SIGTERM during an in-flight tools/call response, that truncated the JSON-RPC
+  // reply on slow pipes. Now we let the event loop drain naturally by setting
+  // process.exitCode and not calling process.exit at all when there's pending
+  // stdio; if the loop is already idle, Node exits anyway. Signals also unref
+  // the SQLite handle via closeStores so the loop has nothing left to keep alive.
   let shuttingDown = false;
   const shutdown = (code = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
     closeStores();
-    // Allow any final stdio flush before exit.
-    setImmediate(() => process.exit(code));
+    process.exitCode = code;
+    // Force an explicit flush + exit fallback: write a no-op then exit in the
+    // callback. process.stdout.write's callback fires after the kernel
+    // accepts the bytes, so any in-flight JSON-RPC reply has flushed by then.
+    process.stdout.write("", () => process.exit(code));
   };
   process.on("SIGTERM", () => shutdown(0));
   process.on("SIGINT", () => shutdown(0));

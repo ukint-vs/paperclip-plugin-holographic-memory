@@ -123,6 +123,11 @@ export async function gcStaleCache(
       }
       await Promise.all(
         entries.map(async (entry) => {
+          // Skip atomic-write tmp files. They're owned by an in-flight or
+          // crashed writer; if we unlink one mid-write, the writer's rename
+          // can succeed against a missing target. The tmp suffix shape is
+          // `.tmp.<pid>.<hex>` set by src/atomic-write.ts.
+          if (entry.includes(".tmp.")) return;
           const file = path.join(dir, entry);
           try {
             const stat = await fs.stat(file);

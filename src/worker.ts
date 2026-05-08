@@ -157,14 +157,22 @@ export async function handleRunStarted(
   // out-of-process MCP server. Awaiting them blocks agent.run.started on
   // ~3 readdirs + N stats with no benefit to the in-process recall path
   // (ctx.state above is the authoritative read inside Paperclip). Failures
-  // are logged via writeRecallCache/gcStaleCache's own try/catch handlers,
-  // and the .catch() here mops up anything they re-throw.
-  void writeRecallCache(config.dbPath, state, ids, log).catch((error: unknown) =>
-    log(`[holographic-memory] writeRecallCache rejected: ${(error as Error).message}`),
-  );
-  void gcStaleCache(config.dbPath, undefined, undefined, log).catch((error: unknown) =>
-    log(`[holographic-memory] gcStaleCache rejected: ${(error as Error).message}`),
-  );
+  // are logged via writeRecallCache/gcStaleCache's own try/catch handlers.
+  // The Promise.resolve().then() wrapper catches synchronous throws (e.g.
+  // a future schema change makes RecallState non-serializable, JSON.stringify
+  // throws inside writeRecallCache before any Promise is returned). Without
+  // it, `.catch()` would never see the error because it'd surface as a sync
+  // throw on the worker's call stack, killing agent.run.started silently.
+  void Promise.resolve()
+    .then(() => writeRecallCache(config.dbPath, state, ids, log))
+    .catch((error: unknown) =>
+      log(`[holographic-memory] writeRecallCache rejected: ${(error as Error).message}`),
+    );
+  void Promise.resolve()
+    .then(() => gcStaleCache(config.dbPath, undefined, undefined, log))
+    .catch((error: unknown) =>
+      log(`[holographic-memory] gcStaleCache rejected: ${(error as Error).message}`),
+    );
 
   return state;
 }
