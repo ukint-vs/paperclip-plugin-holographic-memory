@@ -1,6 +1,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import type { ToolRunContext } from "@paperclipai/plugin-sdk";
 import type { HolographicMemoryConfig } from "../src/types.js";
 
 // Shared test helpers. The previous duplication across worker.spec, dispatch.spec,
@@ -28,4 +29,11 @@ export function baseConfig(
     maxFactsPerRecall: 10,
     ...overrides,
   };
+}
+
+// Minimal ToolRunContext for tests that only exercise the companyId
+// scoping path. The cast is unavoidable because ToolRunContext requires
+// fields the handlers under test never read.
+export function fakeRunCtx(companyId: string): ToolRunContext {
+  return { companyId } as ToolRunContext;
 }

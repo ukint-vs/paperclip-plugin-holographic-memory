@@ -1,5 +1,4 @@
-import type { ToolRunContext } from "@paperclipai/plugin-sdk";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   closeStores,
   dispatchStandaloneAction,
@@ -8,8 +7,9 @@ import {
   handleSearch,
 } from "../src/dispatch.js";
 import { writeRecallCache } from "../src/recall-cache.js";
-import type { RecallState } from "../src/types.js";
-import { baseConfig, tempDb } from "./helpers.js";
+import type { HolographicMemoryConfig, RecallState } from "../src/types.js";
+import { baseConfig, fakeRunCtx, tempDb } from "./helpers.js";
+import type { MemoryStore } from "../src/memory-store.js";
 
 afterEach(() => {
   closeStores();
@@ -183,13 +183,15 @@ describe("CoreActionHandler — companyId pass-through", () => {
   // the standalone MCP server passes no runCtx (companyId is undefined).
   // These tests pin both shapes at the dispatch layer so the cross-tenant
   // path can't silently regress when the dispatch refactor is touched again.
+  let config: HolographicMemoryConfig;
+  let store: MemoryStore;
 
-  const fakeRunCtx = (companyId: string): ToolRunContext =>
-    ({ companyId } as ToolRunContext);
+  beforeEach(() => {
+    config = baseConfig(tempDb());
+    store = getStore(config);
+  });
 
   it("handleSearch with runCtx.companyId scopes to that company plus NULL", async () => {
-    const config = baseConfig(tempDb());
-    const store = getStore(config);
     store.addFact({ content: "Co-A only fact about widgets", companyId: "co-A" });
     store.addFact({ content: "Co-B only fact about widgets", companyId: "co-B" });
     store.addFact({ content: "Global fact about widgets" });
@@ -207,8 +209,6 @@ describe("CoreActionHandler — companyId pass-through", () => {
   });
 
   it("handleSearch with no runCtx (MCP standalone shape) sees every company", async () => {
-    const config = baseConfig(tempDb());
-    const store = getStore(config);
     store.addFact({ content: "Co-A widget fact", companyId: "co-A" });
     store.addFact({ content: "Co-B widget fact", companyId: "co-B" });
 
@@ -219,9 +219,6 @@ describe("CoreActionHandler — companyId pass-through", () => {
   });
 
   it("handleAdd persists runCtx.companyId on the new fact", async () => {
-    const config = baseConfig(tempDb());
-    const store = getStore(config);
-
     const result = await handleAdd(
       store,
       { content: "stored under co-A scope" },
