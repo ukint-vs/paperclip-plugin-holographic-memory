@@ -7,12 +7,12 @@
   "types": "dist/worker.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/worker.js",
-      "types": "./dist/worker.d.ts"
+      "types": "./dist/worker.d.ts",
+      "import": "./dist/worker.js"
     },
     "./manifest": {
-      "import": "./dist/manifest.js",
-      "types": "./dist/manifest.d.ts"
+      "types": "./dist/manifest.d.ts",
+      "import": "./dist/manifest.js"
     },
     "./package.json": "./package.json"
   },
@@ -22,7 +22,6 @@
   },
   "files": [
     "dist",
-    "scripts",
     "LICENSE",
     "README.md"
   ],
