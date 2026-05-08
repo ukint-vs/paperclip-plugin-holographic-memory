@@ -130,30 +130,73 @@ export async function handleRunStarted(
   event: AgentRunEvent,
   config: HolographicMemoryConfig
 ): Promise<RecallState | undefined> {
-  if (!config.recallEnabled || !event.issueId) {
+  // Logger-only instrumentation per TODO #7. Every exit path emits a
+  // structured log so server logs alone tell us "did recall contribute,
+  // and if not, why".
+  const startedAt = Date.now();
+  const elapsed = (): number => Date.now() - startedAt;
+  const eventIds = {
+    runId: event.runId,
+    issueId: event.issueId,
+    agentId: event.agentId,
+    companyId: event.companyId
+  };
+  const skip = (reason: string): undefined => {
+    ctx.logger?.info?.("recall: skipped", { reason, ...eventIds, elapsedMs: elapsed() });
     return undefined;
-  }
+  };
+
+  if (!config.recallEnabled) return skip("disabled");
+  if (!event.issueId) return skip("missing_issue_id");
 
   // companyId is on the PluginEvent envelope (PLUGIN_SPEC §16) and required
   // by issues.get; passing undefined makes the SDK return null and silently
   // disables automated recall. Fall back to ctx.companyId only for tests.
   const companyId = event.companyId ?? (ctx as any).companyId;
-  const issue = await ctx.issues?.get?.(event.issueId, companyId);
+
+  let issue: unknown;
+  try {
+    issue = await ctx.issues?.get?.(event.issueId, companyId);
+  } catch (error) {
+    ctx.logger?.error?.("recall: issue fetch failed", {
+      ...eventIds,
+      elapsedMs: elapsed(),
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return undefined;
+  }
   const query = joinIssueText(issue);
 
-  if (!query.trim()) {
-    return undefined;
-  }
+  if (!query.trim()) return skip("empty_issue");
 
   const store = getStore(config);
-  const facts = store.search(query, {
-    limit: config.maxFactsPerRecall,
-    minTrust: config.minTrustScore
-  });
-
-  if (!facts.length) {
+  let facts;
+  try {
+    facts = store.search(query, {
+      limit: config.maxFactsPerRecall,
+      minTrust: config.minTrustScore,
+      ...(companyId ? { companyId } : {})
+    });
+  } catch (error) {
+    ctx.logger?.error?.("recall: search failed", {
+      ...eventIds,
+      elapsedMs: elapsed(),
+      error: error instanceof Error ? error.message : String(error)
+    });
     return undefined;
   }
+
+  if (!facts.length) return skip("no_facts");
+
+  // Aggregates for the structured log: avgScore tells "did the search
+  // find good matches", avgTrust tells "are surfaced facts trustworthy",
+  // maxScore catches a single strong hit hidden by a weak average.
+  const round3 = (n: number): number => Math.round(n * 1000) / 1000;
+  const scores = facts.map((f) => f.score ?? 0);
+  const trusts = facts.map((f) => f.trustScore);
+  const avgScore = round3(scores.reduce((a, b) => a + b, 0) / scores.length);
+  const maxScore = round3(Math.max(...scores));
+  const avgTrust = round3(trusts.reduce((a, b) => a + b, 0) / trusts.length);
 
   const state: RecallState = {
     query,
@@ -167,18 +210,58 @@ export async function handleRunStarted(
 
   // Write the same recall payload under every available scope so any of
   // run/issue/agent (whichever the agent later asks about) resolves.
-  // The Paperclip SDK already namespaces state by (scopeKind, scopeId),
-  // so we don't need a separate "latest" pointer — runCtx.runId on a tool
-  // call is authoritative.
-  await Promise.all(
-    [
-      event.runId ? scopeFor("run", event.runId) : undefined,
-      event.issueId ? scopeFor("issue", event.issueId) : undefined,
-      event.agentId ? scopeFor("agent", event.agentId) : undefined
-    ]
-      .filter((s): s is ScopeKey => s !== undefined)
-      .map((scope) => writeScopeState(ctx, scope, state))
+  // allSettled (not all): one rejected scope must not silently drop
+  // recall state for the other two — partial success is still useful.
+  const scopeTargets: Array<{ kind: "run" | "issue" | "agent"; scope: ScopeKey }> = [];
+  if (event.runId) scopeTargets.push({ kind: "run", scope: scopeFor("run", event.runId) });
+  if (event.issueId) scopeTargets.push({ kind: "issue", scope: scopeFor("issue", event.issueId) });
+  if (event.agentId) scopeTargets.push({ kind: "agent", scope: scopeFor("agent", event.agentId) });
+
+  const settled = await Promise.allSettled(
+    scopeTargets.map((t) => writeScopeState(ctx, t.scope, state))
   );
+  const scopesWritten: string[] = [];
+  const scopesFailed: string[] = [];
+  settled.forEach((result, i) => {
+    const target = scopeTargets[i];
+    if (!target) return;
+    if (result.status === "fulfilled") {
+      scopesWritten.push(target.kind);
+    } else {
+      scopesFailed.push(target.kind);
+    }
+  });
+
+  if (scopeTargets.length > 0 && scopesWritten.length === 0) {
+    ctx.logger?.error?.("recall: all scope writes failed", {
+      ...eventIds,
+      elapsedMs: elapsed(),
+      scopesFailed,
+      facts: facts.length
+    });
+    return undefined;
+  }
+  if (scopesFailed.length > 0) {
+    ctx.logger?.warn?.("recall: partial scope write failure", {
+      ...eventIds,
+      elapsedMs: elapsed(),
+      scopesWritten,
+      scopesFailed
+    });
+  }
+
+  ctx.logger?.info?.("recall: fired", {
+    facts: facts.length,
+    avgScore,
+    maxScore,
+    avgTrust,
+    minTrust: config.minTrustScore,
+    limit: config.maxFactsPerRecall,
+    scopesWritten,
+    scopesFailed,
+    ...eventIds,
+    elapsedMs: elapsed()
+  });
 
   return state;
 }
@@ -268,6 +351,7 @@ export async function handleRunFinished(
           };
           if (agentId) fact.agentId = agentId;
           if (runId) fact.runId = runId;
+          if (companyId) fact.companyId = companyId;
           const result = store.addFact(fact);
           if (result.inserted) insertedCount += 1;
         } catch (err) {
@@ -334,49 +418,82 @@ function err(message: string): ToolResult {
   return { content: message, error: message };
 }
 
-async function handleSearch(store: MemoryStore, params: ToolParams, config: HolographicMemoryConfig): Promise<ToolResult> {
-  if (!params.query?.trim()) return err("Missing required parameter: query");
-  const facts = store.search(params.query, {
-    limit: params.limit ?? 5,
-    minTrust: params.min_trust ?? config.minTrustScore
-  });
-  return { content: formatFactsAsText(facts) };
-}
-
-async function handleProbe(store: MemoryStore, params: ToolParams, config: HolographicMemoryConfig): Promise<ToolResult> {
-  if (!params.entity?.trim()) return err("Missing required parameter: entity");
-  const facts = store.probe(params.entity, {
-    limit: params.limit ?? 5,
-    minTrust: params.min_trust ?? config.minTrustScore
-  });
-  return { content: formatFactsAsText(facts) };
-}
-
-async function handleRelated(store: MemoryStore, params: ToolParams, config: HolographicMemoryConfig): Promise<ToolResult> {
-  if (!params.entity?.trim()) return err("Missing required parameter: entity");
-  const facts = store.related(params.entity, {
-    limit: params.limit ?? 5,
-    minTrust: params.min_trust ?? config.minTrustScore
-  });
-  return { content: formatFactsAsText(facts) };
-}
-
-async function handleReason(store: MemoryStore, params: ToolParams, config: HolographicMemoryConfig): Promise<ToolResult> {
-  if (!Array.isArray(params.entities) || params.entities.length === 0) {
-    return err("Missing required parameter: entities");
-  }
-  const facts = store.reason(params.entities, {
-    limit: params.limit ?? 5,
-    minTrust: params.min_trust ?? config.minTrustScore
-  });
-  return { content: formatFactsAsText(facts) };
-}
-
-async function handleList(store: MemoryStore, params: ToolParams, config: HolographicMemoryConfig): Promise<ToolResult> {
-  const options: { limit: number; minTrust: number; category?: string } = {
+// Build the read-side options shared by every search-style handler.
+// Cross-tenant scoping piggybacks on this: every read path scopes to
+// the caller's company (plus NULL = global), so two companies sharing a
+// dbPath cannot see each other's facts.
+function readOptions(
+  params: ToolParams,
+  config: HolographicMemoryConfig,
+  runCtx: ToolRunContext
+): { limit: number; minTrust: number; companyId?: string } {
+  const opts: { limit: number; minTrust: number; companyId?: string } = {
     limit: params.limit ?? 5,
     minTrust: params.min_trust ?? config.minTrustScore
   };
+  if (runCtx?.companyId) opts.companyId = runCtx.companyId;
+  return opts;
+}
+
+async function handleSearch(
+  store: MemoryStore,
+  params: ToolParams,
+  config: HolographicMemoryConfig,
+  _ctx: any,
+  runCtx: ToolRunContext
+): Promise<ToolResult> {
+  if (!params.query?.trim()) return err("Missing required parameter: query");
+  const facts = store.search(params.query, readOptions(params, config, runCtx));
+  return { content: formatFactsAsText(facts) };
+}
+
+async function handleProbe(
+  store: MemoryStore,
+  params: ToolParams,
+  config: HolographicMemoryConfig,
+  _ctx: any,
+  runCtx: ToolRunContext
+): Promise<ToolResult> {
+  if (!params.entity?.trim()) return err("Missing required parameter: entity");
+  const facts = store.probe(params.entity, readOptions(params, config, runCtx));
+  return { content: formatFactsAsText(facts) };
+}
+
+async function handleRelated(
+  store: MemoryStore,
+  params: ToolParams,
+  config: HolographicMemoryConfig,
+  _ctx: any,
+  runCtx: ToolRunContext
+): Promise<ToolResult> {
+  if (!params.entity?.trim()) return err("Missing required parameter: entity");
+  const facts = store.related(params.entity, readOptions(params, config, runCtx));
+  return { content: formatFactsAsText(facts) };
+}
+
+async function handleReason(
+  store: MemoryStore,
+  params: ToolParams,
+  config: HolographicMemoryConfig,
+  _ctx: any,
+  runCtx: ToolRunContext
+): Promise<ToolResult> {
+  if (!Array.isArray(params.entities) || params.entities.length === 0) {
+    return err("Missing required parameter: entities");
+  }
+  const facts = store.reason(params.entities, readOptions(params, config, runCtx));
+  return { content: formatFactsAsText(facts) };
+}
+
+async function handleList(
+  store: MemoryStore,
+  params: ToolParams,
+  config: HolographicMemoryConfig,
+  _ctx: any,
+  runCtx: ToolRunContext
+): Promise<ToolResult> {
+  const base = readOptions(params, config, runCtx);
+  const options: { limit: number; minTrust: number; category?: string; companyId?: string } = { ...base };
   if (params.category) options.category = params.category;
   const facts = store.listFacts(options);
   // D6 / Codex C10: list is a CRUD/inventory op, returns JSON.
@@ -417,10 +534,12 @@ async function handleRecallContext(
   }
 
   if (params.query?.trim()) {
-    const facts = store.search(params.query, {
+    const opts: { limit: number; minTrust: number; companyId?: string } = {
       limit: params.limit ?? config.maxFactsPerRecall,
       minTrust: params.min_trust ?? config.minTrustScore
-    });
+    };
+    if (runCtx?.companyId) opts.companyId = runCtx.companyId;
+    const facts = store.search(params.query, opts);
     return { content: formatFactsAsText(facts) };
   }
 
@@ -430,7 +549,13 @@ async function handleRecallContext(
   };
 }
 
-async function handleAdd(store: MemoryStore, params: ToolParams): Promise<ToolResult> {
+async function handleAdd(
+  store: MemoryStore,
+  params: ToolParams,
+  _config: HolographicMemoryConfig,
+  _ctx: any,
+  runCtx: ToolRunContext
+): Promise<ToolResult> {
   if (typeof params.content !== "string" || !params.content.trim()) {
     return err("Missing required parameter: content");
   }
@@ -438,6 +563,7 @@ async function handleAdd(store: MemoryStore, params: ToolParams): Promise<ToolRe
   if (typeof params.category === "string") fact.category = params.category;
   if (params.tags !== undefined) fact.tags = params.tags;
   if (typeof params.trust_score === "number") fact.trustScore = params.trust_score;
+  if (runCtx?.companyId) fact.companyId = runCtx.companyId;
   const result = store.addFact(fact);
   return { content: JSON.stringify(result), data: result };
 }

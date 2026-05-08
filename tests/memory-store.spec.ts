@@ -464,6 +464,74 @@ describe("MemoryStore", () => {
       expect(first as unknown as Record<string, unknown>).not.toHaveProperty("ftsRankRaw");
     });
   });
+
+  describe("cross-tenant scoping", () => {
+    it("isolates search results by companyId, with NULL = global", () => {
+      const store = freshStore();
+      store.addFact({ content: "Company A: vara wallet decision", category: "project", trustScore: 0.8, companyId: "co-A" });
+      store.addFact({ content: "Company B: vara wallet decision", category: "project", trustScore: 0.8, companyId: "co-B" });
+      store.addFact({ content: "Global vara wallet primer", category: "project", trustScore: 0.8 });
+
+      const aResults = store.search("vara wallet", { limit: 10, minTrust: 0.3, companyId: "co-A" });
+      const aContent = aResults.map((f) => f.content).sort();
+      expect(aContent).toEqual([
+        "Company A: vara wallet decision",
+        "Global vara wallet primer"
+      ].sort());
+
+      const bResults = store.search("vara wallet", { limit: 10, minTrust: 0.3, companyId: "co-B" });
+      const bContent = bResults.map((f) => f.content).sort();
+      expect(bContent).toEqual([
+        "Company B: vara wallet decision",
+        "Global vara wallet primer"
+      ].sort());
+
+      // Without companyId (server audit), every row is visible.
+      const all = store.search("vara wallet", { limit: 10, minTrust: 0.3 });
+      expect(all).toHaveLength(3);
+    });
+
+    it("scopes per-company dedup so the same content can land for two companies", () => {
+      const store = freshStore();
+      const a = store.addFact({ content: "Same fact text", category: "project", trustScore: 0.8, companyId: "co-A" });
+      expect(a.inserted).toBe(true);
+
+      // The table-level UNIQUE on facts.content blocks the second
+      // INSERT — surface the collision instead of leaking co-A's
+      // fact_id back to co-B. Resolved by #9 (table recreation).
+      const b = store.addFact({ content: "Same fact text", category: "project", trustScore: 0.8, companyId: "co-B" });
+      expect(b.inserted).toBe(false);
+      expect(b.reason).toBe("content_collision");
+    });
+
+    it("addFact returns existing factId when same (content, companyId) is re-inserted", () => {
+      const store = freshStore();
+      const first = store.addFact({ content: "Repeat fact", category: "project", companyId: "co-A" });
+      expect(first.inserted).toBe(true);
+      const again = store.addFact({ content: "Repeat fact", category: "project", companyId: "co-A" });
+      expect(again.inserted).toBe(false);
+      expect(again.factId).toBe(first.factId);
+      expect(again.reason).toBeUndefined();
+    });
+
+    it("populates companyId on returned facts", () => {
+      const store = freshStore();
+      store.addFact({ content: "Tagged fact for co-A", category: "project", trustScore: 0.8, companyId: "co-A" });
+      const [fact] = store.search("tagged", { limit: 5, minTrust: 0, companyId: "co-A" });
+      expect(fact?.companyId).toBe("co-A");
+    });
+
+    it("listFacts honors companyId scope", () => {
+      const store = freshStore();
+      store.addFact({ content: "List A", category: "project", companyId: "co-A" });
+      store.addFact({ content: "List B", category: "project", companyId: "co-B" });
+      store.addFact({ content: "List global", category: "project" });
+
+      const a = store.listFacts({ minTrust: 0, limit: 10, companyId: "co-A" });
+      const aContent = a.map((f) => f.content).sort();
+      expect(aContent).toEqual(["List A", "List global"].sort());
+    });
+  });
 });
 
 function tempDbPath(): string {

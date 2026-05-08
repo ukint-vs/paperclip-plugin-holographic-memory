@@ -124,6 +124,208 @@ describe("worker", () => {
     expect([...state.keys()].some((k) => k.startsWith("run:"))).toBe(false);
     expect([...state.keys()].some((k) => k.startsWith("agent:"))).toBe(false);
   });
+
+  // -- TODO #7: structured logging on the recall flow ----------------------
+
+  it("#7: logs `recall: fired` with structured aggregates and scopesWritten", async () => {
+    const dbPath = createDb();
+    const { ctx: stateCtx } = fakeStateCtx();
+    const info = vi.fn();
+    const warn = vi.fn();
+    const error = vi.fn();
+    const ctx = {
+      ...stateCtx,
+      logger: { info, warn, error },
+      issues: {
+        get: async () => ({
+          title: "Vara wallet IDL",
+          description: "Need context on IDL-aware calls."
+        })
+      }
+    };
+
+    await handleRunStarted(
+      ctx,
+      { issueId: "issue-1", runId: "run-1", agentId: "agent-1", companyId: "co-7" },
+      baseConfig(dbPath)
+    );
+
+    expect(info).toHaveBeenCalledTimes(1);
+    const [msg, meta] = info.mock.calls[0] as [string, Record<string, unknown>];
+    expect(msg).toBe("recall: fired");
+    expect(meta).toMatchObject({
+      runId: "run-1",
+      issueId: "issue-1",
+      agentId: "agent-1",
+      companyId: "co-7"
+    });
+    expect(meta.facts).toBeGreaterThanOrEqual(1);
+    expect(typeof meta.avgScore).toBe("number");
+    expect(typeof meta.maxScore).toBe("number");
+    expect(typeof meta.avgTrust).toBe("number");
+    expect(typeof meta.elapsedMs).toBe("number");
+    expect(meta.scopesWritten).toEqual(expect.arrayContaining(["run", "issue", "agent"]));
+    expect(meta.scopesFailed).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["disabled", { recallEnabled: false }, { issueId: "issue-x" }],
+    ["missing_issue_id", {}, {}],
+    ["empty_issue", {}, { issueId: "issue-empty" }],
+    ["no_facts", {}, { issueId: "issue-nomatch" }]
+  ] as const)("#7: logs `recall: skipped` with reason=%s", async (reason, configOverrides, eventOverrides) => {
+    const dbPath = createDb();
+    const { ctx: stateCtx } = fakeStateCtx();
+    const info = vi.fn();
+    const ctx = {
+      ...stateCtx,
+      logger: { info, warn: vi.fn(), error: vi.fn() },
+      issues: {
+        get: async () => {
+          if (reason === "empty_issue") return { title: "", description: "" };
+          if (reason === "no_facts") return { title: "completely-unrelated-tokens-xyzzy" };
+          return { title: "ignored" };
+        }
+      }
+    };
+    const result = await handleRunStarted(ctx, eventOverrides, baseConfig(dbPath, configOverrides));
+    expect(result).toBeUndefined();
+    const skipCalls = info.mock.calls.filter((c) => c[0] === "recall: skipped");
+    expect(skipCalls).toHaveLength(1);
+    expect(skipCalls[0]?.[1]).toMatchObject({ reason });
+  });
+
+  it("#7: Promise.allSettled tolerates a partial scope-write failure and logs warn", async () => {
+    const dbPath = createDb();
+    const state = new Map<string, unknown>();
+    let calls = 0;
+    const info = vi.fn();
+    const warn = vi.fn();
+    const error = vi.fn();
+    const ctx = {
+      logger: { info, warn, error },
+      state: {
+        // Reject the first scope write only; let the rest succeed.
+        set: async (scope: ScopeKey, value: unknown) => {
+          calls += 1;
+          if (calls === 1) throw new Error("scope-write rejected");
+          state.set(`${scope.scopeKind}:${scope.scopeId}:${scope.namespace}:${scope.stateKey}`, value);
+        }
+      },
+      issues: {
+        get: async () => ({ title: "Vara wallet IDL" })
+      }
+    };
+
+    const result = await handleRunStarted(
+      ctx,
+      { issueId: "issue-p", runId: "run-p", agentId: "agent-p" },
+      baseConfig(dbPath)
+    );
+
+    expect(result).toBeDefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    const [warnMsg, warnMeta] = warn.mock.calls[0] as [string, Record<string, unknown>];
+    expect(warnMsg).toBe("recall: partial scope write failure");
+    expect(warnMeta.scopesFailed).toHaveLength(1);
+    expect(warnMeta.scopesWritten).toHaveLength(2);
+    // Success log still fires.
+    expect(info.mock.calls.filter((c) => c[0] === "recall: fired")).toHaveLength(1);
+  });
+
+  it("#7: search throw surfaces error log and returns undefined", async () => {
+    const dbPath = createDb();
+    const { ctx: stateCtx } = fakeStateCtx();
+    const error = vi.fn();
+    const info = vi.fn();
+    const ctx = {
+      ...stateCtx,
+      logger: { info, warn: vi.fn(), error },
+      issues: {
+        // Force a query that triggers FTS, then break the store via a
+        // shadowed config dbPath that's invalid — simpler: spy on the
+        // store search via a thrown-at-top-level approach.
+        get: async () => ({ title: "Vara wallet IDL" })
+      }
+    };
+
+    // Simulate search failure by pointing at a non-existent dbPath
+    // parent that better-sqlite3 cannot create.
+    const config = baseConfig(dbPath);
+    // Override store.search via prototype patch on the singleton.
+    const { MemoryStore: MS } = await import("../src/memory-store.js");
+    const origSearch = MS.prototype.search;
+    MS.prototype.search = function () {
+      throw new Error("synthetic search failure");
+    };
+    try {
+      const result = await handleRunStarted(
+        ctx,
+        { issueId: "issue-search-throw", runId: "run-x" },
+        config
+      );
+      expect(result).toBeUndefined();
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(error.mock.calls[0]?.[0]).toBe("recall: search failed");
+    } finally {
+      MS.prototype.search = origSearch;
+    }
+  });
+
+  it("#7: issue fetch throw surfaces error log and returns undefined", async () => {
+    const dbPath = createDb();
+    const { ctx: stateCtx } = fakeStateCtx();
+    const error = vi.fn();
+    const ctx = {
+      ...stateCtx,
+      logger: { info: vi.fn(), warn: vi.fn(), error },
+      issues: {
+        get: async () => {
+          throw new Error("network down");
+        }
+      }
+    };
+    const result = await handleRunStarted(
+      ctx,
+      { issueId: "issue-fetch-throw", runId: "run-x" },
+      baseConfig(dbPath)
+    );
+    expect(result).toBeUndefined();
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(error.mock.calls[0]?.[0]).toBe("recall: issue fetch failed");
+  });
+
+  // -- Cross-tenant: companyId reaches the store search options ------------
+
+  it("cross-tenant: forwards event.companyId into store.search options", async () => {
+    const dbPath = createDb();
+    const { ctx: stateCtx } = fakeStateCtx();
+    const ctx = {
+      ...stateCtx,
+      issues: { get: async () => ({ title: "Vara wallet IDL" }) }
+    };
+
+    const { MemoryStore: MS } = await import("../src/memory-store.js");
+    const origSearch = MS.prototype.search;
+    const captured: Array<Record<string, unknown> | undefined> = [];
+    MS.prototype.search = function (this: unknown, query: string, options?: Record<string, unknown>) {
+      captured.push(options);
+      return origSearch.call(this as never, query, options as never);
+    } as typeof origSearch;
+    try {
+      await handleRunStarted(
+        ctx,
+        { issueId: "issue-1", runId: "run-1", companyId: "co-tenant-x" },
+        baseConfig(dbPath)
+      );
+      expect(captured).toHaveLength(1);
+      expect(captured[0]?.companyId).toBe("co-tenant-x");
+    } finally {
+      MS.prototype.search = origSearch;
+    }
+  });
 });
 
 describe("dispatchAction — recall_context", () => {

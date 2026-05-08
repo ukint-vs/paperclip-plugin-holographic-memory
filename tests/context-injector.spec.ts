@@ -12,7 +12,8 @@ const fact: MemoryFact = {
   helpfulCount: 0,
   source: null,
   agentId: null,
-  runId: null
+  runId: null,
+  companyId: null
 };
 
 describe("context formatting", () => {
