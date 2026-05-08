@@ -70,6 +70,12 @@ function closeStores(): void {
   storeRegistry.clear();
 }
 
+function joinIssueText(issue: any): string {
+  return [issue?.title, issue?.description, issue?.body]
+    .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
+    .join("\n");
+}
+
 const plugin = definePlugin({
   async setup(ctx: any) {
     const config = resolvePluginConfig(await readConfig(ctx));
@@ -100,13 +106,8 @@ export default plugin;
 runWorker(plugin, import.meta.url);
 
 export function extractRunFields(event: any): AgentRunEvent {
-  // PluginEvent gives us companyId/actorId/entityId at the top level and a
-  // typed payload underneath. Pull the IDs we care about from either spot,
-  // tolerating the duck-typed test ctx that hands us a flat object.
-  // Shared between agent.run.started and agent.run.finished — the
-  // envelope-level fields are identical (decision 2A); finished
-  // additionally carries startedAt/finishedAt on the payload, used by
-  // handleRunFinished's time-window filter (D13).
+  // PluginEvent ships IDs at the top level and a typed payload underneath;
+  // duck-type both spots so flat test fixtures also work.
   const payload = event?.payload ?? event ?? {};
   const fields: AgentRunEvent = {};
   const runId = event?.entityId ?? event?.runId ?? payload.runId;
@@ -138,9 +139,7 @@ export async function handleRunStarted(
   // disables automated recall. Fall back to ctx.companyId only for tests.
   const companyId = event.companyId ?? (ctx as any).companyId;
   const issue = await ctx.issues?.get?.(event.issueId, companyId);
-  const query = [issue?.title, issue?.description, issue?.body]
-    .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
-    .join("\n");
+  const query = joinIssueText(issue);
 
   if (!query.trim()) {
     return undefined;
@@ -184,24 +183,6 @@ export async function handleRunStarted(
   return state;
 }
 
-// Auto-extract handler for `agent.run.finished` (#11).
-//
-// Pipeline (matches the diagram in the plan file):
-//   1. Guards: retainEnabled, issueId, startedAt + finishedAt — fail
-//      closed when timestamps are missing rather than write false
-//      provenance (D13).
-//   2. Fetch sources: issue body + comments. Both calls live inside one
-//      try/catch so a single failure logs and aborts cleanly without
-//      crashing the SDK event handler (decision 1C).
-//   3. Filter comments: human-authored (`authorUserId != null`, D12) AND
-//      contemporaneous with the run window (D13).
-//   4. Regex pass via `extractFactsFromText` over each source string.
-//   5. Insert via `store.addFact` with `source/agentId/runId` populated.
-//      Each addFact is wrapped in try/catch (Hermes line 380 pattern)
-//      so one bad row doesn't abort peers.
-//   6. Log once at info level with the inserted-count — only after the
-//      regex pass completes. Early-return guards skip this log so the
-//      log line means "the handler ran end-to-end" (clarification C9).
 export async function handleRunFinished(
   ctx: any,
   event: AgentRunEvent,
@@ -213,8 +194,6 @@ export async function handleRunFinished(
   if (!event.issueId) {
     return undefined;
   }
-  // Hoisted once; reused in every log line so a future placeholder change
-  // (e.g. switching to runId) only happens in one place.
   const runLabel = event.runId ?? "<unknown>";
 
   if (!event.startedAt || !event.finishedAt) {
@@ -247,17 +226,15 @@ export async function handleRunFinished(
       ctx.issues?.get?.(issueId, companyId),
       ctx.issues?.listComments?.(issueId, companyId)
     ]);
-    const bodyText = [issue?.title, issue?.description, issue?.body]
-      .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
-      .join("\n");
+    const bodyText = joinIssueText(issue);
 
     const filteredComments = (rawComments ?? []).filter((comment: any) => {
-      // D12: only humans. Agent comments saying "I prefer X" are
-      // self-talk, not user preferences. authorUserId presence is the
-      // canonical "human authored" signal in the SDK shape.
+      // Humans only — agent comments saying "I prefer X" are self-talk,
+      // not user preferences. authorUserId presence is the canonical
+      // "human authored" signal in the SDK shape.
       if (!comment?.authorUserId) return false;
-      // D13: only contemporaneous comments. createdAt is a Date or ISO
-      // string depending on the host; normalize via Date.parse.
+      // Contemporaneous comments only, so run_id provenance stays
+      // honest. createdAt is Date or ISO string depending on host.
       const createdAtMs =
         comment.createdAt instanceof Date
           ? comment.createdAt.getTime()
@@ -281,9 +258,8 @@ export async function handleRunFinished(
       const hits = extractFactsFromText(text);
       for (const hit of hits) {
         try {
-          // exactOptionalPropertyTypes forbids `field: value | undefined`
-          // on optional props — build the fact incrementally and only
-          // attach agentId/runId when present.
+          // exactOptionalPropertyTypes forbids `field: undefined` on
+          // optional props; build incrementally and skip absent fields.
           const fact: Parameters<MemoryStore["addFact"]>[0] = {
             content: hit.content,
             category: hit.category,
@@ -295,11 +271,8 @@ export async function handleRunFinished(
           const result = store.addFact(fact);
           if (result.inserted) insertedCount += 1;
         } catch (err) {
-          // Inner catch — mirrors Hermes' on_session_end pattern in
-          // ~/.hermes/hermes-agent/plugins/memory/holographic/__init__.py
-          // (the `_auto_extract_facts` try/except around add_fact): one
-          // bad insertion (e.g. SQLite lock race) must not abort the
-          // loop. Logged for diagnostics; not rethrown.
+          // One bad insertion (SQLite lock race, constraint violation)
+          // must not abort peers in the same run.
           ctx.logger?.warn?.(
             `auto-extract: addFact failed in run ${runLabel}`,
             err
@@ -313,9 +286,8 @@ export async function handleRunFinished(
     );
     return { inserted: insertedCount };
   } catch (err) {
-    // Outer catch (decision 1C): network blips on issues.get /
-    // listComments must not throw out of an SDK event handler. Log and
-    // exit cleanly — the next run.finished will retry naturally.
+    // Network blips on issues.get / listComments must not throw out of
+    // an SDK event handler.
     ctx.logger?.error?.(
       `auto-extract: failed for run ${runLabel}`,
       err

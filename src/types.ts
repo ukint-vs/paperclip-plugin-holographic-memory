@@ -15,9 +15,8 @@ export interface MemoryFact {
   retrievalCount: number;
   helpfulCount: number;
   score?: number;
-  // Provenance columns (D11). NULL on curated facts; populated on
-  // auto-extracted ones so SQL filters like `WHERE source = 'auto'`
-  // work without a tags-string scan.
+  // Provenance — NULL on curated facts, populated on auto-extracted
+  // ones so `WHERE source = 'auto'` works without a tags-string scan.
   source: string | null;
   agentId: string | null;
   runId: string | null;
@@ -38,13 +37,9 @@ export interface NewMemoryFact {
   runId?: string;
 }
 
-// Shared envelope shape pulled from `agent.run.started` and
-// `agent.run.finished` plugin events. The SDK ships `PluginEvent<T>` with
-// IDs at the top level (entityId/actorId/companyId) and a typed payload
-// underneath; we duck-type both. The `started`/`finished` envelopes
-// expose the same envelope-level fields, so one type covers both
-// handlers (decision 2A). `startedAt`/`finishedAt` come from the
-// `finished` payload and are required by the time-window filter (D13).
+// Shared envelope shape duck-typed from `agent.run.started` and
+// `agent.run.finished`. `startedAt`/`finishedAt` only populated for
+// finished events; the time-window filter requires them.
 export interface AgentRunEvent {
   runId?: string;
   agentId?: string;

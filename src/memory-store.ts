@@ -358,10 +358,8 @@ export class MemoryStore {
       (this.db.prepare("PRAGMA table_info(facts)").all() as { name: string }[]).map((column) => column.name)
     );
 
-    // Idempotent column-add: PRAGMA-checked, ALTER only when missing.
-    // The provenance trio (source/agent_id/run_id) ships with #11; the
-    // helpful_count/hrr_vector pair predates this PR. All five collapse
-    // into a single migration once the real framework (#9) lands.
+    // Idempotent column-add shim — collapses into a real migration when
+    // the migration framework (#9) lands.
     const addColumnIfMissing = (name: string, type: string): void => {
       if (!columns.has(name)) {
         this.db.prepare(`ALTER TABLE facts ADD COLUMN ${name} ${type}`).run();
@@ -370,8 +368,6 @@ export class MemoryStore {
 
     addColumnIfMissing("helpful_count", "INTEGER DEFAULT 0");
     addColumnIfMissing("hrr_vector", "BLOB");
-    // Provenance shim (#11 / D11). Auto-extracted facts populate these;
-    // curator/agent writes leave them NULL.
     addColumnIfMissing("source", "TEXT");
     addColumnIfMissing("agent_id", "TEXT");
     addColumnIfMissing("run_id", "TEXT");
@@ -570,8 +566,7 @@ function mapFactRow(row: FactRow): MemoryFact {
     retrievalCount: row.retrieval_count ?? 0,
     helpfulCount: row.helpful_count ?? 0,
     // Explicit null (not undefined) for unset provenance — matches
-    // SQLite NULL semantics so consumers can fact.source === null
-    // without ambiguity (C12).
+    // SQLite NULL so consumers can `fact.source === null` unambiguously.
     source: row.source ?? null,
     agentId: row.agent_id ?? null,
     runId: row.run_id ?? null

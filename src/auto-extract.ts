@@ -31,11 +31,8 @@ interface CategoryPattern {
   patterns: RegExp[];
 }
 
-// Patterns ported verbatim from Hermes' `_auto_extract_facts` in
-// ~/.hermes/hermes-agent/plugins/memory/holographic/__init__.py
-// (the two pattern blocks above the `for msg in messages` loop).
-// Keep this list locked to Hermes parity — adding patterns is a separate
-// PR that needs its own quality review.
+// Patterns ported verbatim from Hermes' `_auto_extract_facts`. Keep
+// locked to parity — adding patterns is a separate quality review.
 const CATEGORY_PATTERNS: CategoryPattern[] = [
   {
     category: "user_pref",
@@ -68,15 +65,11 @@ export function extractFactsFromText(text: string): ExtractedFact[] {
     for (const pattern of patterns) {
       const match = pattern.exec(text);
       if (match) {
-        // match[0] is the entire matched substring (verb + capture).
-        // Truncated to 400 chars matches the storage cap; the regex
-        // ran against the full input, so a pattern hitting at source
-        // position 600 still produces a fact (just truncated content).
         facts.push({
           content: match[0].slice(0, MAX_CONTENT_LENGTH),
           category
         });
-        break; // first-match-wins per category (Hermes parity)
+        break;
       }
     }
   }
