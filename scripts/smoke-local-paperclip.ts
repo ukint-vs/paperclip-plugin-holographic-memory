@@ -4,8 +4,9 @@
  * Prereqs:
  *   - Paperclip server running on http://127.0.0.1:3100 in `local_trusted` mode
  *     (auth bypass on every request — see paperclip server/src/middleware/auth.ts).
- *   - Embedded Postgres reachable at postgres://postgres:postgres@localhost:54329/postgres
- *     (Paperclip's default when no DATABASE_URL is set).
+ *   - Embedded Postgres reachable at postgres://paperclip:paperclip@127.0.0.1:54329/paperclip
+ *     (Paperclip's default when no DATABASE_URL is set — see paperclip
+ *     packages/db/src/migration-runtime.ts).
  *   - This plugin built (`pnpm build`).
  *
  * Bring-up command, copy-pasteable:
@@ -192,7 +193,7 @@ async function ensurePluginInstalled(): Promise<string> {
   const list = await getJson<Array<{ id: string; pluginKey?: string }>>("/api/plugins");
   const rows = Array.isArray(list.data)
     ? list.data
-    : ((list.data as any).plugins as Array<{ id: string; pluginKey?: string }> | undefined) ?? [];
+    : ((list.data as any)?.plugins as Array<{ id: string; pluginKey?: string }> | undefined) ?? [];
   const found = rows.find((p) => p.pluginKey === PLUGIN_KEY);
   if (!found) bail(`Install failed and plugin not found by key ${PLUGIN_KEY}`, { installResp: data, list: list.data });
   return found.id;
