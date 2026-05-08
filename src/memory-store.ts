@@ -23,6 +23,14 @@ interface FactRow {
   helpful_count: number | null;
   hrr_vector?: Buffer | null;
   score?: number;
+  fts_rank_raw?: number | null;
+}
+
+// Internal scoring shape — vector + raw FTS rank carried through the
+// search pipeline, stripped before results leave the store.
+interface ScorableFact extends MemoryFact {
+  hrrVector?: Float64Array;
+  ftsRankRaw?: number;
 }
 
 interface MemoryStoreOptions {
@@ -59,21 +67,32 @@ export class MemoryStore {
     const remaining = Math.max(0, limit * 3 - byText.length);
 
     const byEntity = this.searchEntities(query, remaining, minTrust);
-    const merged = new Map<number, MemoryFact>();
+    // FTS branch wins on collision: it carries both the vector and the rank.
+    const merged = new Map<number, ScorableFact>();
+    for (const fact of byEntity) merged.set(fact.factId, fact);
+    for (const fact of byText) merged.set(fact.factId, fact);
 
-    for (const fact of [...byText, ...byEntity]) {
-      merged.set(fact.factId, fact);
-    }
+    // Normalize FTS rank across the candidate batch. FTS5 rank is negative
+    // (lower = better); abs(rank)/maxAbs produces [0, 1] where best = 1.
+    // 1e-6 floor prevents NaN when only entity-branch hits (no rank) exist.
+    const candidates = [...merged.values()];
+    const maxAbsRank = Math.max(
+      ...candidates.map((c) => Math.abs(c.ftsRankRaw ?? 0)),
+      1e-6
+    );
+    const ftsLookup = (fact: ScorableFact): number =>
+      fact.ftsRankRaw == null ? 0 : Math.abs(fact.ftsRankRaw) / maxAbsRank;
 
     const queryTokens = tokenize(query);
     const queryVector = this.hrrEnabled ? encodeText(query, this.hrrDim) : undefined;
-    const results = [...merged.values()]
-      .map((fact) => scoreFact(fact, queryTokens, queryVector))
+
+    const scored = candidates
+      .map((fact) => scoreFact(fact, queryTokens, queryVector, ftsLookup))
       .sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || b.trustScore - a.trustScore || a.factId - b.factId)
       .slice(0, limit);
 
-    this.incrementRetrievalCounts(results.map((fact) => fact.factId));
-    return results;
+    this.incrementRetrievalCounts(scored.map((fact) => fact.factId));
+    return scored.map(stripScoringFields);
   }
 
   close(): void {
@@ -335,11 +354,11 @@ export class MemoryStore {
     }
   }
 
-  private searchFts(query: string, limit: number, minTrust: number): MemoryFact[] {
+  private searchFts(query: string, limit: number, minTrust: number): ScorableFact[] {
     const rows = this.db
       .prepare(
         `SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score, f.retrieval_count,
-                f.helpful_count, f.hrr_vector
+                f.helpful_count, f.hrr_vector, facts_fts.rank AS fts_rank_raw
          FROM facts_fts
          JOIN facts f ON facts_fts.rowid = f.fact_id
          WHERE facts_fts MATCH ?
@@ -349,17 +368,17 @@ export class MemoryStore {
       )
       .all(query, minTrust, limit) as FactRow[];
 
-    return rows.map(mapFactRow);
+    return rows.map(mapFactRowWithVector);
   }
 
-  private searchEntities(query: string, limit: number, minTrust: number): MemoryFact[] {
+  private searchEntities(query: string, limit: number, minTrust: number): ScorableFact[] {
     const terms = extractEntityTerms(query);
 
     if (!terms.length) {
       return [];
     }
 
-    const results = new Map<number, MemoryFact>();
+    const results = new Map<number, ScorableFact>();
     const stmt = this.db.prepare(
       `SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score, f.retrieval_count,
               f.helpful_count, f.hrr_vector
@@ -377,7 +396,7 @@ export class MemoryStore {
       const rows = stmt.all(pattern, pattern, minTrust, limit) as FactRow[];
 
       for (const row of rows) {
-        results.set(row.fact_id, mapFactRow(row));
+        results.set(row.fact_id, mapFactRowWithVector(row));
       }
     }
 
@@ -536,6 +555,22 @@ function mapFactRow(row: FactRow): MemoryFact {
   return fact;
 }
 
+function mapFactRowWithVector(row: FactRow): ScorableFact {
+  const fact: ScorableFact = mapFactRow(row);
+  if (row.hrr_vector) {
+    fact.hrrVector = bytesToPhases(row.hrr_vector);
+  }
+  if (typeof row.fts_rank_raw === "number") {
+    fact.ftsRankRaw = row.fts_rank_raw;
+  }
+  return fact;
+}
+
+function stripScoringFields(scorable: ScorableFact): MemoryFact {
+  const { hrrVector: _v, ftsRankRaw: _r, ...rest } = scorable;
+  return rest;
+}
+
 function normalizeLimit(value: number | undefined): number {
   if (typeof value !== "number" || Number.isNaN(value)) {
     return 5;
@@ -639,15 +674,31 @@ function tokenize(text: string): Set<string> {
   );
 }
 
-function scoreFact(fact: MemoryFact, queryTokens: Set<string>, queryVector?: Float64Array): MemoryFact {
+// Hermes-aligned blend: 40% FTS rank + 30% Jaccard + 30% HRR similarity,
+// then weighted by trust. Mirrors retrieval.py:91-94 in the Hermes plugin.
+//
+// TODO(hrr-unbind-variant): Stored fact vectors come from `encodeFact`,
+// which binds content to `__hrr_role_content__`. We're comparing a raw
+// `encodeText(query)` to the bundled fact vector — strictly the math
+// would prefer `similarity(qVec, unbind(fact.hrrVector, role_content))`.
+// Hermes does the raw form too; revisit once we have real recall data.
+function scoreFact(
+  fact: ScorableFact,
+  queryTokens: Set<string>,
+  queryVector: Float64Array | undefined,
+  ftsLookup: (fact: ScorableFact) => number
+): ScorableFact {
   const factTokens = tokenize(`${fact.content} ${fact.tags}`);
   const overlap = [...queryTokens].filter((token) => factTokens.has(token)).length;
   const union = new Set([...queryTokens, ...factTokens]).size || 1;
   const jaccard = overlap / union;
-  const relevance = queryVector ? 0.7 * jaccard + 0.3 * 0.5 : jaccard;
 
-  return {
-    ...fact,
-    score: relevance * fact.trustScore
-  };
+  const hrr =
+    queryVector && fact.hrrVector
+      ? (similarity(queryVector, fact.hrrVector) + 1) / 2
+      : 0.5;
+  const fts = ftsLookup(fact);
+  const relevance = 0.4 * fts + 0.3 * jaccard + 0.3 * hrr;
+
+  return { ...fact, score: relevance * fact.trustScore };
 }
