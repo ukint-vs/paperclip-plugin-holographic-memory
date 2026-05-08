@@ -52,6 +52,9 @@ Without #8 stale kill-verdicts crowd out fresh truth. #9 must land before
 | 10 | [#13 — Concurrent-write stress test](https://github.com/ukint-vs/paperclip-plugin-holographic-memory/issues/13) | open | — | ~2h | ~15m |
 | 11 | [#16 — Settings UI smoke test](https://github.com/ukint-vs/paperclip-plugin-holographic-memory/issues/16) | open | #3 | ~1h | n/a alone |
 | 12 | [#5 — Publish plugin to npm when stable](https://github.com/ukint-vs/paperclip-plugin-holographic-memory/issues/5) | open | tier 1 + 2 done | ~½d | ~30m |
+| 13 | `setup:mcp --refresh` reads Paperclip plugin config directly | open | #20 merged | ~½d | ~30m |
+
+**#13 detail:** today `--refresh` re-reads `--db-path` flag or `PAPERCLIP_HOLO_MEMORY_DB` env, then rewrites the MCP entry. Better: locate Paperclip's persisted plugin instance config (path TBD — needs a small read of paperclip server source) and pull the live `dbPath` from there so a Settings UI change auto-propagates on next `pnpm setup:mcp --refresh`. Couples the script to Paperclip's config layout; defer until Paperclip stabilizes that layout.
 
 **Rationale:** All additive. #14 and #12 unlock filters and safety for #11's
 auto-extracted facts. #15 only matters past ~thousands of facts. #5 (npm publish)

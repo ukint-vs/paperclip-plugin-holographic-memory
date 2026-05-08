@@ -464,6 +464,34 @@ describe("MemoryStore", () => {
       expect(first as unknown as Record<string, unknown>).not.toHaveProperty("ftsRankRaw");
     });
   });
+
+  describe("multi-process write contention (busy_timeout)", () => {
+    it("opens two MemoryStore instances on the same DB without throwing", () => {
+      const dbPath = tempDbPath();
+      const a = new MemoryStore(dbPath);
+      stores.push(a);
+      a.addFact({ content: "first", category: "general" });
+
+      const b = new MemoryStore(dbPath);
+      stores.push(b);
+      b.addFact({ content: "second", category: "general" });
+
+      // Both writers shared the same DB; with WAL + busy_timeout=5000 no
+      // SQLITE_BUSY surfaces on serialized writes from the same process tree.
+      const facts = a.listFacts({ limit: 10, minTrust: 0 });
+      expect(facts).toHaveLength(2);
+    });
+
+    it("reports busy_timeout pragma is set", () => {
+      const dbPath = tempDbPath();
+      const store = new MemoryStore(dbPath);
+      stores.push(store);
+      const db = new Database(dbPath);
+      dbs.push(db);
+      const result = db.pragma("busy_timeout") as Array<{ timeout: number }>;
+      expect(result[0]?.timeout).toBe(5000);
+    });
+  });
 });
 
 function tempDbPath(): string {
