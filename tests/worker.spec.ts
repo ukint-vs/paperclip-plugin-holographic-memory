@@ -235,6 +235,39 @@ describe("worker", () => {
     expect(info.mock.calls.filter((c) => c[0] === "recall: fired")).toHaveLength(1);
   });
 
+  it("#7: every scope-write rejection surfaces `recall: all scope writes failed` and returns undefined", async () => {
+    const dbPath = createDb();
+    const info = vi.fn();
+    const warn = vi.fn();
+    const error = vi.fn();
+    const ctx = {
+      logger: { info, warn, error },
+      state: {
+        set: async () => {
+          throw new Error("scope-write rejected");
+        }
+      },
+      issues: {
+        get: async () => ({ title: "Vara wallet IDL" })
+      }
+    };
+
+    const result = await handleRunStarted(
+      ctx,
+      { issueId: "issue-allfail", runId: "run-allfail", agentId: "agent-allfail" },
+      baseConfig(dbPath)
+    );
+
+    expect(result).toBeUndefined();
+    expect(error).toHaveBeenCalledTimes(1);
+    const [errMsg, errMeta] = error.mock.calls[0] as [string, Record<string, unknown>];
+    expect(errMsg).toBe("recall: all scope writes failed");
+    expect(errMeta.scopesFailed).toEqual(expect.arrayContaining(["run", "issue", "agent"]));
+    // Neither the success line nor the partial-failure warn should fire.
+    expect(info.mock.calls.filter((c) => c[0] === "recall: fired")).toHaveLength(0);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("#7: search throw surfaces error log and returns undefined", async () => {
     const dbPath = createDb();
     const { ctx: stateCtx } = fakeStateCtx();
