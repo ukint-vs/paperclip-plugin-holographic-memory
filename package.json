@@ -15,6 +15,7 @@
   "scripts": {
     "build": "tsup src/worker.ts src/manifest.ts src/ui/index.tsx --format esm --dts --clean",
     "seed:paperclip": "tsx scripts/seed-from-paperclip.ts",
+    "import:facts": "tsx scripts/import-facts.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
