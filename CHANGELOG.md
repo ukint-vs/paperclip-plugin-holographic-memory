@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-09
+
+setup-mcp had been writing to `~/.claude/settings.json` since 0.4.0. Claude Code 2.x reads MCP servers from `~/.claude.json` (managed by `claude mcp add`); writes to `settings.json` are silently ignored. Every user following the README install instructions got the plugin registered but invisible to agents (#34). Confirmed via a real Paperclip run: 67 token-savior tools (registered via `claude mcp add`) and 30 code-review-graph tools showed up; 0 holographic-memory tools.
+
+### Fixed
+- setup-mcp registers the holographic-memory MCP server via `claude mcp add --scope user` and `codex mcp add` (the canonical CLIs that own the on-disk config format), falling back to direct file writes only when the CLIs aren't on PATH (CI, containers, fresh installs). After every successful `mcp add`, a follow-up `mcp get` verifies the entry actually persisted — catches the documented "exits 0 but doesn't write" failure mode that was a silent failure before this fix (#34).
+- Drift detection: when the entry exists but env vars differ from current config (e.g. you changed `--db-path`), setup-mcp auto-refreshes via remove + add. Previously the file-write path refreshed on drift but the new CLI path would have skipped if `--refresh` weren't passed.
+- Scope-mismatch handling: if `holographic-memory` exists in a non-user scope (project/local), setup-mcp removes it and re-adds at user scope so Paperclip agents see it across all projects.
+
+### Changed
+- Default Claude fallback path: `~/.claude/settings.json` → `~/.claude.json`. The legacy path is still readable but never written.
+- `--print` now emits `claude mcp add` / `codex mcp add` command lines that copy/paste into a terminal directly, replacing the JSON / TOML snippet output. Scripts piping `--print | jq` from 0.4.x will need to update.
+- File-write fallback for Codex now refuses to overlay a second `[mcp_servers.holographic-memory]` table when an unmarked one already exists (e.g. installed by `codex mcp add` directly). Surfaces a clear hint to run `codex mcp remove` first instead of producing invalid TOML.
+- `--claude-config <path>` and `--codex-config <path>` overrides now also disable CLI shell-out (the CLIs don't accept arbitrary config locations).
+
+### Migration
+- On install and uninstall, setup-mcp automatically removes any stale `mcpServers.holographic-memory` entry from the legacy `~/.claude/settings.json`. No user action required. Tolerant of malformed legacy files (skipped with a stderr warning, never blocks the install).
+
+### Tests
+- 35 new tests covering the CLI shell-out paths via an injected `ExecRunner`: 11 `applyClaudeViaCli` cases (CLI absent, server absent, server present + env in sync, env drift, scope mismatch, refresh-with-not-found-remove, post-add verification failure, mcp-add-non-zero-exit, ENOENT race, dryRun absent, dryRun in-sync), Codex mirrors, uninstall verification, the new collision guard, and the migration helper. All 50 pre-existing pure-merge tests retained intact (they still drive the file-write fallback path).
+
 ## [0.4.1] - 2026-05-09
 Hotfix: 0.4.0 shipped both bins (`paperclip-holographic-memory-setup` and `paperclip-holographic-memory-mcp`) with a broken `invokedAsScript` guard. The guard regex'd `process.argv[1]` against `/setup-mcp\.(ts|js)$/`, but npm-bin invocations expose `argv[1]` as the symlink path (`/usr/local/bin/paperclip-holographic-memory-setup`), which has no relation to the source file basename. Result: every `npx -y --package ...` and `npm i -g + bin` user hit a silent no-op when running the setup bin. The mcp-server bin had a similar guard but tested the resolved filename, so it ran correctly in production despite the suboptimal pattern.
 

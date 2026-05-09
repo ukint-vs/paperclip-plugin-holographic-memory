@@ -1,25 +1,44 @@
 #!/usr/bin/env node
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import TOML from "@iarna/toml";
 import { atomicWrite } from "../src/atomic-write.js";
 import { isInvokedAsScript } from "../src/invoked-as-script.js";
 
-// Idempotent merger that registers (or removes) the holographic-memory MCP
-// server in the user's Claude Code (~/.claude/settings.json -> mcpServers)
-// and Codex (~/.codex/config.toml -> [mcp_servers.holographic-memory]) configs.
+// Registers (or removes) the holographic-memory MCP server via the official
+// CLIs (`claude mcp add --scope user`, `codex mcp add`), falling back to
+// direct file writes (~/.claude.json, ~/.codex/config.toml) when the CLI is
+// unavailable.
 //
-// Behavior matrix:
+// Issue #34 background: previous versions wrote ~/.claude/settings.json
+// (Claude Code 1.x location). Claude Code 2.x reads ~/.claude.json instead,
+// so the old write was silently ignored. setup-mcp ≤0.4.1 left a stale
+// entry in ~/.claude/settings.json; install/uninstall now cleans that up
+// automatically.
+//
+// Behavior matrix (file fallback path):
 //   missing file       -> create with mode 0600 (install) / no-op (uninstall)
 //   valid file         -> backup .bak, atomic merge (tmp + rename)
 //   malformed (parse)  -> abort exit 2 with diagnostic, never touch the file
 //   malformed (shape)  -> abort exit 2 (e.g. mcpServers is a string/array/null)
 //   symlink            -> resolved write
-//   --print            -> stdout only, no writes (install OR uninstall snippets)
+//   --print            -> stdout only, no writes (CLI command lines)
 //   --dry-run          -> diff-style preview, no writes
-//   --refresh          -> rewrite the entry even if marker present (install-only)
-//   --uninstall        -> remove the entry from both configs (mirror of install)
+//   --refresh          -> rewrite the entry even if present (install-only)
+//   --uninstall        -> remove the entry (mirror of install)
+//
+// CLI shell-out path:
+//   - Install runs `mcp get` for idempotency, `mcp remove` then `mcp add` on
+//     refresh / drift / scope mismatch, then a second `mcp get` to verify the
+//     entry actually persisted (catches "exit 0 but didn't write" failures).
+//   - CLI not on PATH (ENOENT) -> fall back to file write.
+//   - CLI present but errored -> hard fail (don't fall back; falling back
+//     would create config drift between the two locations).
+//   - --claude-config <custom> forces file fallback (the CLI doesn't accept
+//     arbitrary config locations).
 //
 // Concurrent runs: unsupported. The .bak rotation + atomic-rename pair is
 // not transactional across processes; running install + uninstall (or two
@@ -38,6 +57,12 @@ const TOML_MARKER_BEGIN = `# managed by paperclip-plugin-${SERVER_NAME}`;
 const TOML_MARKER_END = `# end paperclip-plugin-${SERVER_NAME}`;
 const DEFAULT_DB_PATH = "~/.paperclip/instances/default/hermes-memory.db";
 const DEFAULT_COMMAND = "npx";
+const DEFAULT_CLAUDE_PATH = path.join(homedir(), ".claude.json");
+const LEGACY_CLAUDE_SETTINGS_PATH = path.join(homedir(), ".claude", "settings.json");
+const DEFAULT_CODEX_PATH = path.join(homedir(), ".codex", "config.toml");
+const CLAUDE_CLI = "claude";
+const CODEX_CLI = "codex";
+const CLI_EXEC_TIMEOUT_MS = 10_000;
 // `-y` suppresses npx's install prompt. `--package <PACKAGE_NAME>` tells npx
 // which package to install before running the bin — without it, npx assumes
 // the bin name equals the package name and either fails or installs a
@@ -149,8 +174,8 @@ export function parseArgs(argv: string[]): CliOptions {
     maxRecall: parseFlag(argv, "max-recall", (s) => Number(s)) ?? 10,
     command,
     args: argsFlag ?? DEFAULT_ARGS,
-    claudePath: parseFlag(argv, "claude-config", (s) => s) ?? path.join(homedir(), ".claude", "settings.json"),
-    codexPath: parseFlag(argv, "codex-config", (s) => s) ?? path.join(homedir(), ".codex", "config.toml"),
+    claudePath: parseFlag(argv, "claude-config", (s) => s) ?? DEFAULT_CLAUDE_PATH,
+    codexPath: parseFlag(argv, "codex-config", (s) => s) ?? DEFAULT_CODEX_PATH,
   };
 }
 
@@ -443,7 +468,7 @@ export function mergeCodexUninstall(existing: string): MergeOutcome {
   return { changed: true, reason: `remove [mcp_servers.${SERVER_NAME}] block`, output };
 }
 
-async function applyCodex(opts: CliOptions): Promise<MergeOutcome> {
+export async function applyCodex(opts: CliOptions): Promise<MergeOutcome> {
   const block = buildCodexBlock(opts);
   let existing = "";
   if (await pathExists(opts.codexPath)) {
@@ -460,6 +485,15 @@ async function applyCodex(opts: CliOptions): Promise<MergeOutcome> {
         `Refusing to overwrite ${opts.codexPath}: existing TOML is malformed (${(error as Error).message}). Fix the file or pass --print and copy manually.`,
       );
     }
+  }
+  // Guard #1.5: refuse to overlay a second [mcp_servers.holographic-memory]
+  // table when an unmarked one is already present (likely added by
+  // `codex mcp add` directly). Appending a second same-named table would
+  // produce invalid TOML and trip Guard #2 with a confusing error.
+  if (hasUnmarkedCodexEntry(existing)) {
+    throw new Error(
+      `Refusing to overlay ${opts.codexPath}: an existing [mcp_servers.${SERVER_NAME}] section without our markers is present (likely added by 'codex mcp add' directly). Run 'codex mcp remove ${SERVER_NAME}' first, or pass --print to copy the new block manually.`,
+    );
   }
   const outcome = mergeCodexConfig(existing, block, opts.refresh);
   // Guard #2: validate the resulting TOML parses cleanly. We never write
@@ -478,7 +512,7 @@ async function applyCodex(opts: CliOptions): Promise<MergeOutcome> {
   return outcome;
 }
 
-async function applyCodexUninstall(opts: CliOptions): Promise<MergeOutcome> {
+export async function applyCodexUninstall(opts: CliOptions): Promise<MergeOutcome> {
   if (!(await pathExists(opts.codexPath))) {
     return { changed: false, reason: "no codex config present", output: "" };
   }
@@ -492,6 +526,14 @@ async function applyCodexUninstall(opts: CliOptions): Promise<MergeOutcome> {
   } catch (error) {
     throw new Error(
       `Refusing to overwrite ${opts.codexPath}: existing TOML is malformed (${(error as Error).message}). Fix the file or pass --print and copy manually.`,
+    );
+  }
+  // If an unmarked [mcp_servers.holographic-memory] section is present, our
+  // marker-block uninstall would leave it dangling. Surface the hint instead
+  // of silently doing nothing.
+  if (hasUnmarkedCodexEntry(existing)) {
+    throw new Error(
+      `Refusing to uninstall: ${opts.codexPath} has an unmarked [mcp_servers.${SERVER_NAME}] section (likely added by 'codex mcp add' directly). Run 'codex mcp remove ${SERVER_NAME}' instead.`,
     );
   }
   const outcome = mergeCodexUninstall(existing);
@@ -511,22 +553,431 @@ async function applyCodexUninstall(opts: CliOptions): Promise<MergeOutcome> {
 }
 
 // ---------------------------------------------------------------------------
+// CLI shell-out helpers
+//
+// `claude mcp add --scope user` and `codex mcp add` are the canonical entry
+// points; they own the on-disk config format. We prefer them over direct
+// file writes — the file-write path is the fallback for users who don't
+// have the CLIs on PATH (CI, containers, fresh installs before the CLIs
+// are available).
+//
+// Detection vs error semantics:
+//   CLI not on PATH (ENOENT)    -> return null, caller falls back to file write
+//   CLI present, exits non-zero -> hard fail (don't fall back; that would
+//                                  create config drift between two locations)
+// ---------------------------------------------------------------------------
+
+const execFileAsync = promisify(execFile);
+
+export interface ExecResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+  codeName?: string; // e.g. "ENOENT" when binary missing
+}
+
+export type ExecRunner = (cmd: string, args: string[], timeoutMs: number) => Promise<ExecResult>;
+
+const defaultExecRunner: ExecRunner = async (cmd, args, timeoutMs) => {
+  try {
+    const { stdout, stderr } = await execFileAsync(cmd, args, {
+      timeout: timeoutMs,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return { code: 0, stdout, stderr };
+  } catch (error) {
+    const e = error as NodeJS.ErrnoException & {
+      code?: string | number;
+      stdout?: string;
+      stderr?: string;
+    };
+    // execFile rejects with code:'ENOENT' when binary missing,
+    // and with code:<number> when child exits non-zero.
+    if (typeof e.code === "string") {
+      return { code: -1, stdout: "", stderr: e.message ?? "", codeName: e.code };
+    }
+    const exit = typeof e.code === "number" ? e.code : 1;
+    return { code: exit, stdout: e.stdout ?? "", stderr: e.stderr ?? e.message ?? "" };
+  }
+};
+
+let _execRunner: ExecRunner = defaultExecRunner;
+export function _setExecRunnerForTests(fn: ExecRunner): void {
+  _execRunner = fn;
+}
+export function _resetExecRunnerForTests(): void {
+  _execRunner = defaultExecRunner;
+}
+
+// Pure builders — no spawning, easy to unit-test.
+export function buildClaudeMcpAddArgs(opts: CliOptions): string[] {
+  const envFlags: string[] = [];
+  for (const [k, v] of Object.entries(buildEnv(opts))) {
+    envFlags.push("--env", `${k}=${v}`);
+  }
+  return [
+    "mcp",
+    "add",
+    "--scope",
+    "user",
+    "--transport",
+    "stdio",
+    ...envFlags,
+    SERVER_NAME,
+    "--",
+    opts.command,
+    ...opts.args,
+  ];
+}
+
+export function buildCodexMcpAddArgs(opts: CliOptions): string[] {
+  const envFlags: string[] = [];
+  for (const [k, v] of Object.entries(buildEnv(opts))) {
+    envFlags.push("--env", `${k}=${v}`);
+  }
+  return ["mcp", "add", ...envFlags, SERVER_NAME, "--", opts.command, ...opts.args];
+}
+
+// Custom --claude-config / --codex-config disables CLI shell-out: the CLIs
+// don't accept arbitrary config locations, so an explicit path override
+// implies the caller has opted into the file-write path.
+export function shouldUseClaudeCli(opts: CliOptions): boolean {
+  return opts.claudePath === DEFAULT_CLAUDE_PATH;
+}
+export function shouldUseCodexCli(opts: CliOptions): boolean {
+  return opts.codexPath === DEFAULT_CODEX_PATH;
+}
+
+async function detectCli(cli: string): Promise<boolean> {
+  const result = await _execRunner(cli, ["--version"], CLI_EXEC_TIMEOUT_MS);
+  return result.code === 0;
+}
+
+export interface ServerProbe {
+  present: boolean;
+  scopeMatches: boolean; // claude only — codex has no scopes (always true there)
+  rawOutput: string;
+}
+
+async function probeServer(cli: string, serverName: string): Promise<ServerProbe> {
+  const result = await _execRunner(cli, ["mcp", "get", serverName], CLI_EXEC_TIMEOUT_MS);
+  if (result.code !== 0) {
+    return { present: false, scopeMatches: false, rawOutput: result.stdout + result.stderr };
+  }
+  const raw = result.stdout;
+  // claude mcp get prints "Scope: User config" (or "Project config" / "Local config").
+  // codex mcp get has no concept of scope, so always true.
+  const scopeMatches = cli === CLAUDE_CLI ? /Scope:\s*User config/i.test(raw) : true;
+  return { present: true, scopeMatches, rawOutput: raw };
+}
+
+// Compares expected env vars against the raw text output of `mcp get`.
+// Claude prints "    KEY=VALUE" lines; Codex prints "env: KEY=*****"
+// (values masked). When values are masked, fall back to key-presence check —
+// users can force a refresh via --refresh when they need exact-value sync.
+function envInSync(expected: Record<string, string>, raw: string, cli: "claude" | "codex"): boolean {
+  if (cli === "codex") {
+    return Object.keys(expected).every((k) => raw.includes(k));
+  }
+  return Object.entries(expected).every(([k, v]) => raw.includes(`${k}=${v}`));
+}
+
+export async function applyClaudeViaCli(opts: CliOptions): Promise<MergeOutcome | null> {
+  if (!shouldUseClaudeCli(opts)) return null;
+  if (!(await detectCli(CLAUDE_CLI))) return null;
+
+  const probe = await probeServer(CLAUDE_CLI, SERVER_NAME);
+  const expectedEnv = buildEnv(opts);
+  let mustRefresh = false;
+  let driftReason = "";
+
+  if (probe.present) {
+    if (!probe.scopeMatches) {
+      driftReason = "scope mismatch (entry exists in non-user scope)";
+      mustRefresh = true;
+    } else if (!envInSync(expectedEnv, probe.rawOutput, "claude")) {
+      driftReason = "env drift detected";
+      mustRefresh = true;
+    }
+  }
+
+  const willChange = !probe.present || opts.refresh || mustRefresh;
+  const addArgs = buildClaudeMcpAddArgs(opts);
+
+  if (opts.dryRun) {
+    if (!willChange) {
+      return {
+        changed: false,
+        reason: "already registered via claude mcp (user scope, env in sync)",
+        output: "",
+      };
+    }
+    const reason = !probe.present
+      ? `would run: ${CLAUDE_CLI} ${addArgs.join(" ")}`
+      : `would refresh via claude mcp (${driftReason || "explicit --refresh"})`;
+    return { changed: true, reason, output: "" };
+  }
+
+  if (probe.present && !willChange) {
+    return {
+      changed: false,
+      reason: "already registered via claude mcp (user scope, env in sync)",
+      output: "",
+    };
+  }
+
+  if (probe.present && willChange) {
+    const removeRes = await _execRunner(
+      CLAUDE_CLI,
+      ["mcp", "remove", "--scope", "user", SERVER_NAME],
+      CLI_EXEC_TIMEOUT_MS,
+    );
+    if (removeRes.codeName === "ENOENT") return null;
+    if (removeRes.code !== 0 && !/not found/i.test(removeRes.stderr + removeRes.stdout)) {
+      throw new Error(
+        `claude mcp remove failed: ${removeRes.stderr.trim() || removeRes.stdout.trim()}`,
+      );
+    }
+  }
+
+  const addRes = await _execRunner(CLAUDE_CLI, addArgs, CLI_EXEC_TIMEOUT_MS);
+  if (addRes.codeName === "ENOENT") return null;
+  if (addRes.code !== 0) {
+    throw new Error(`claude mcp add failed: ${addRes.stderr.trim() || addRes.stdout.trim()}`);
+  }
+
+  // Post-add verification — catches "exits 0 but didn't write" failures
+  // (wrong scope, permissions, races).
+  const verify = await probeServer(CLAUDE_CLI, SERVER_NAME);
+  if (!verify.present || !verify.scopeMatches) {
+    throw new Error(
+      `claude mcp add reported success but \`claude mcp get ${SERVER_NAME}\` ${
+        !verify.present ? "still doesn't see the entry" : "shows it in the wrong scope"
+      }; refusing to claim install succeeded.`,
+    );
+  }
+
+  return {
+    changed: true,
+    reason: probe.present
+      ? `refreshed via claude mcp (${driftReason || "explicit --refresh"})`
+      : "registered via claude mcp add",
+    output: "",
+  };
+}
+
+export async function applyCodexViaCli(opts: CliOptions): Promise<MergeOutcome | null> {
+  if (!shouldUseCodexCli(opts)) return null;
+  if (!(await detectCli(CODEX_CLI))) return null;
+
+  const probe = await probeServer(CODEX_CLI, SERVER_NAME);
+  const expectedEnv = buildEnv(opts);
+  let mustRefresh = false;
+  let driftReason = "";
+
+  if (probe.present && !envInSync(expectedEnv, probe.rawOutput, "codex")) {
+    driftReason = "env keys missing — possible drift";
+    mustRefresh = true;
+  }
+
+  const willChange = !probe.present || opts.refresh || mustRefresh;
+  const addArgs = buildCodexMcpAddArgs(opts);
+
+  if (opts.dryRun) {
+    if (!willChange) {
+      return { changed: false, reason: "already registered via codex mcp", output: "" };
+    }
+    const reason = !probe.present
+      ? `would run: ${CODEX_CLI} ${addArgs.join(" ")}`
+      : `would refresh via codex mcp (${driftReason || "explicit --refresh"})`;
+    return { changed: true, reason, output: "" };
+  }
+
+  if (probe.present && !willChange) {
+    return { changed: false, reason: "already registered via codex mcp", output: "" };
+  }
+
+  if (probe.present && willChange) {
+    const removeRes = await _execRunner(
+      CODEX_CLI,
+      ["mcp", "remove", SERVER_NAME],
+      CLI_EXEC_TIMEOUT_MS,
+    );
+    if (removeRes.codeName === "ENOENT") return null;
+    if (removeRes.code !== 0 && !/not found/i.test(removeRes.stderr + removeRes.stdout)) {
+      throw new Error(
+        `codex mcp remove failed: ${removeRes.stderr.trim() || removeRes.stdout.trim()}`,
+      );
+    }
+  }
+
+  const addRes = await _execRunner(CODEX_CLI, addArgs, CLI_EXEC_TIMEOUT_MS);
+  if (addRes.codeName === "ENOENT") return null;
+  if (addRes.code !== 0) {
+    throw new Error(`codex mcp add failed: ${addRes.stderr.trim() || addRes.stdout.trim()}`);
+  }
+
+  const verify = await probeServer(CODEX_CLI, SERVER_NAME);
+  if (!verify.present) {
+    throw new Error(
+      `codex mcp add reported success but \`codex mcp get ${SERVER_NAME}\` still doesn't see the entry; refusing to claim install succeeded.`,
+    );
+  }
+
+  return {
+    changed: true,
+    reason: probe.present
+      ? `refreshed via codex mcp (${driftReason || "explicit --refresh"})`
+      : "registered via codex mcp add",
+    output: "",
+  };
+}
+
+export async function applyClaudeUninstallViaCli(opts: CliOptions): Promise<MergeOutcome | null> {
+  if (!shouldUseClaudeCli(opts)) return null;
+  if (!(await detectCli(CLAUDE_CLI))) return null;
+
+  const probe = await probeServer(CLAUDE_CLI, SERVER_NAME);
+  if (!probe.present) {
+    return { changed: false, reason: "absent (claude mcp)", output: "" };
+  }
+
+  if (opts.dryRun) {
+    return {
+      changed: true,
+      reason: `would run: claude mcp remove --scope user ${SERVER_NAME}`,
+      output: "",
+    };
+  }
+
+  const removeRes = await _execRunner(
+    CLAUDE_CLI,
+    ["mcp", "remove", "--scope", "user", SERVER_NAME],
+    CLI_EXEC_TIMEOUT_MS,
+  );
+  if (removeRes.codeName === "ENOENT") return null;
+  if (removeRes.code !== 0 && !/not found/i.test(removeRes.stderr + removeRes.stdout)) {
+    throw new Error(
+      `claude mcp remove failed: ${removeRes.stderr.trim() || removeRes.stdout.trim()}`,
+    );
+  }
+
+  const verify = await probeServer(CLAUDE_CLI, SERVER_NAME);
+  if (verify.present && verify.scopeMatches) {
+    throw new Error(
+      `claude mcp remove reported success but the entry is still present in user scope.`,
+    );
+  }
+
+  return { changed: true, reason: "removed via claude mcp", output: "" };
+}
+
+export async function applyCodexUninstallViaCli(opts: CliOptions): Promise<MergeOutcome | null> {
+  if (!shouldUseCodexCli(opts)) return null;
+  if (!(await detectCli(CODEX_CLI))) return null;
+
+  const probe = await probeServer(CODEX_CLI, SERVER_NAME);
+  if (!probe.present) {
+    return { changed: false, reason: "absent (codex mcp)", output: "" };
+  }
+
+  if (opts.dryRun) {
+    return { changed: true, reason: `would run: codex mcp remove ${SERVER_NAME}`, output: "" };
+  }
+
+  const removeRes = await _execRunner(
+    CODEX_CLI,
+    ["mcp", "remove", SERVER_NAME],
+    CLI_EXEC_TIMEOUT_MS,
+  );
+  if (removeRes.codeName === "ENOENT") return null;
+  if (removeRes.code !== 0 && !/not found/i.test(removeRes.stderr + removeRes.stdout)) {
+    throw new Error(
+      `codex mcp remove failed: ${removeRes.stderr.trim() || removeRes.stdout.trim()}`,
+    );
+  }
+
+  const verify = await probeServer(CODEX_CLI, SERVER_NAME);
+  if (verify.present) {
+    throw new Error(`codex mcp remove reported success but the entry is still present.`);
+  }
+
+  return { changed: true, reason: "removed via codex mcp", output: "" };
+}
+
+// Best-effort cleanup of the legacy ~/.claude/settings.json entry that
+// setup-mcp ≤0.4.1 wrote. Tolerant of malformed JSON / bad shape — never
+// blocks the install path on legacy file corruption.
+export async function migrateLegacyClaudeSettings(dryRun: boolean): Promise<MergeOutcome> {
+  const target = LEGACY_CLAUDE_SETTINGS_PATH;
+  if (!(await pathExists(target))) {
+    return { changed: false, reason: "no legacy settings.json", output: "" };
+  }
+  const raw = await fs.readFile(target, "utf8");
+  if (raw.trim().length === 0) {
+    return { changed: false, reason: "legacy settings.json empty", output: "" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    process.stderr.write(`[claude:migrate] skipped: invalid JSON (${(error as Error).message})\n`);
+    return { changed: false, reason: "legacy settings.json malformed", output: "" };
+  }
+  let validated: ClaudeSettingsLike;
+  try {
+    validated = validateClaudeSettings(parsed, target);
+  } catch (error) {
+    process.stderr.write(`[claude:migrate] skipped: ${(error as Error).message}\n`);
+    return { changed: false, reason: "legacy settings.json bad shape", output: "" };
+  }
+  const outcome = mergeClaudeUninstall(validated);
+  if (!outcome.changed) return outcome;
+  if (!dryRun) {
+    const realTarget = await resolveTarget(target);
+    await backup(realTarget);
+    await atomicWrite(realTarget, outcome.output, 0o600);
+  }
+  return outcome;
+}
+
+// Detect a [mcp_servers.holographic-memory] table without our begin/end
+// markers — the shape created by `codex mcp add` (or hand-edited configs).
+// Used by the file-write fallback to refuse to overlay a second same-named
+// table (TOML parse failure on the second [mcp_servers.X] declaration).
+export function hasUnmarkedCodexEntry(existing: string): boolean {
+  const tableHeaderRe = new RegExp(`^\\[mcp_servers\\.${SERVER_NAME}\\]\\s*$`, "m");
+  if (!tableHeaderRe.test(existing)) return false;
+  return !TOML_MARKER_BEGIN_RE.test(existing);
+}
+
+// ---------------------------------------------------------------------------
 // Output helpers
 // ---------------------------------------------------------------------------
 
-function printSnippets(opts: CliOptions): void {
-  const claudeEntry = buildClaudeEntry(opts);
-  const claudeSnippet = JSON.stringify({ mcpServers: { [SERVER_NAME]: claudeEntry } }, null, 2);
-  process.stdout.write(`# Add to ${opts.claudePath} (merge into mcpServers):\n${claudeSnippet}\n\n`);
-  process.stdout.write(`# Add to ${opts.codexPath} (append):\n${buildCodexBlock(opts)}\n`);
+// Shell-quote a single argument for copy-paste-into-terminal output.
+function shellQuote(s: string): string {
+  if (s.length === 0) return "''";
+  if (/[\s"'$`\\!*?(){}[\]<>|;&#~]/.test(s)) {
+    return `'${s.replace(/'/g, `'\\''`)}'`;
+  }
+  return s;
 }
 
-function printUninstallSnippets(opts: CliOptions): void {
-  process.stdout.write(`# Remove from ${opts.claudePath} (delete this key under mcpServers):\n  "${SERVER_NAME}"\n\n`);
-  process.stdout.write(
-    `# Remove from ${opts.codexPath} (delete from BEGIN through END marker, inclusive):\n${TOML_MARKER_BEGIN}\n[mcp_servers.${SERVER_NAME}]\n... (config lines) ...\n${TOML_MARKER_END}\n`,
-  );
+function printSnippets(opts: CliOptions): void {
+  const claudeCmd = [CLAUDE_CLI, ...buildClaudeMcpAddArgs(opts)].map(shellQuote).join(" ");
+  const codexCmd = [CODEX_CLI, ...buildCodexMcpAddArgs(opts)].map(shellQuote).join(" ");
+  process.stdout.write(`# Claude Code (writes ~/.claude.json):\n${claudeCmd}\n\n`);
+  process.stdout.write(`# Codex (writes ~/.codex/config.toml):\n${codexCmd}\n`);
 }
+
+function printUninstallSnippets(_opts: CliOptions): void {
+  process.stdout.write(`# Claude Code:\nclaude mcp remove --scope user ${SERVER_NAME}\n\n`);
+  process.stdout.write(`# Codex:\ncodex mcp remove ${SERVER_NAME}\n`);
+}
+
+type CliApply = () => Promise<MergeOutcome | null>;
+type FileApply = () => Promise<MergeOutcome>;
 
 async function run(opts: CliOptions): Promise<number> {
   if (opts.print) {
@@ -538,28 +989,46 @@ async function run(opts: CliOptions): Promise<number> {
     return 0;
   }
 
-  type Apply = () => Promise<MergeOutcome>;
-  const tasks: Array<["claude" | "codex", string, Apply]> = [];
+  interface Task {
+    label: "claude" | "codex";
+    target: string;
+    cliApply: CliApply;
+    fileApply: FileApply;
+  }
+  const tasks: Task[] = [];
   if (opts.scope === "claude" || opts.scope === "both") {
-    tasks.push([
-      "claude",
-      opts.claudePath,
-      opts.uninstall ? () => applyClaudeUninstall(opts) : () => applyClaude(opts),
-    ]);
+    tasks.push({
+      label: "claude",
+      target: opts.claudePath,
+      cliApply: opts.uninstall
+        ? () => applyClaudeUninstallViaCli(opts)
+        : () => applyClaudeViaCli(opts),
+      fileApply: opts.uninstall ? () => applyClaudeUninstall(opts) : () => applyClaude(opts),
+    });
   }
   if (opts.scope === "codex" || opts.scope === "both") {
-    tasks.push([
-      "codex",
-      opts.codexPath,
-      opts.uninstall ? () => applyCodexUninstall(opts) : () => applyCodex(opts),
-    ]);
+    tasks.push({
+      label: "codex",
+      target: opts.codexPath,
+      cliApply: opts.uninstall
+        ? () => applyCodexUninstallViaCli(opts)
+        : () => applyCodexViaCli(opts),
+      fileApply: opts.uninstall ? () => applyCodexUninstall(opts) : () => applyCodex(opts),
+    });
   }
 
   let allClean = true;
-  for (const [label, target, fn] of tasks) {
+  for (const { label, target, cliApply, fileApply } of tasks) {
     let outcome: MergeOutcome;
+    let usedCli = false;
     try {
-      outcome = await fn();
+      const cliOutcome = await cliApply();
+      if (cliOutcome === null) {
+        outcome = await fileApply();
+      } else {
+        outcome = cliOutcome;
+        usedCli = true;
+      }
     } catch (error) {
       process.stderr.write(`[${label}] ${(error as Error).message}\n`);
       return 2;
@@ -570,21 +1039,51 @@ async function run(opts: CliOptions): Promise<number> {
     }
     allClean = false;
     if (opts.dryRun) {
-      // outcome.reason already names the action ("add"/"remove"/"refresh"),
-      // so the prefix is just "would" regardless of install vs uninstall.
-      process.stdout.write(`[${label}] ${target}: would ${outcome.reason}\n`);
-      process.stdout.write(`---- ${target} (preview) ----\n${outcome.output}---- end preview ----\n`);
+      // outcome.reason already names the action; "would" prefix only added
+      // for file-write outcomes (CLI outcomes self-describe with "would run:").
+      const prefix = usedCli ? "" : "would ";
+      process.stdout.write(`[${label}] ${target}: ${prefix}${outcome.reason}\n`);
+      if (!usedCli && outcome.output) {
+        process.stdout.write(`---- ${target} (preview) ----\n${outcome.output}---- end preview ----\n`);
+      }
       continue;
     }
-    // Resolve symlinks so we update the real file (the dotfile-repo source
-    // for stow / chezmoi / nix-home-manager users) instead of replacing the
-    // symlink with a regular file via fs.rename. Backup also operates on
-    // the resolved path so the .bak sits next to the real source.
+    if (usedCli) {
+      // CLI already wrote the file; nothing more to do.
+      process.stdout.write(`[${label}] ${outcome.reason}\n`);
+      continue;
+    }
+    // File-write fallback: resolve symlinks so we update the real file
+    // (the dotfile-repo source for stow / chezmoi / nix-home-manager users)
+    // instead of replacing the symlink with a regular file via fs.rename.
+    // Backup also operates on the resolved path so the .bak sits next to
+    // the real source.
     const realTarget = await resolveTarget(target);
     await backup(realTarget);
     await atomicWrite(realTarget, outcome.output, 0o600);
     const noteSuffix = realTarget !== target ? ` (resolved from ${target})` : "";
-    process.stdout.write(`[${label}] ${realTarget}${noteSuffix}: ${outcome.reason}; backup at ${realTarget}.bak\n`);
+    process.stdout.write(
+      `[${label}] ${realTarget}${noteSuffix}: ${outcome.reason}; backup at ${realTarget}.bak\n`,
+    );
+  }
+
+  // Always run legacy migration on Claude scope, regardless of CLI vs file
+  // path taken. Cheap (one stat + one parse on missing-or-tiny file) and
+  // closes the issue-34 dangling-entry case for users upgrading from
+  // setup-mcp ≤0.4.1.
+  if (opts.scope === "claude" || opts.scope === "both") {
+    try {
+      const legacy = await migrateLegacyClaudeSettings(opts.dryRun);
+      if (legacy.changed) {
+        const prefix = opts.dryRun ? "would remove" : "removed";
+        process.stdout.write(
+          `[claude:migrate] ${prefix} stale entry from ${LEGACY_CLAUDE_SETTINGS_PATH}\n`,
+        );
+      }
+    } catch (error) {
+      // Migration is best-effort; never block the install path on it.
+      process.stderr.write(`[claude:migrate] non-fatal: ${(error as Error).message}\n`);
+    }
   }
 
   if (opts.dryRun && allClean) {
@@ -598,13 +1097,16 @@ async function main(): Promise<void> {
   if (argv.includes("--help") || argv.includes("-h")) {
     process.stdout.write(`Usage: setup-mcp [options]
 
-Registers (or removes) the holographic-memory MCP server in:
-  ~/.claude/settings.json   (Claude Code mcpServers)
-  ~/.codex/config.toml      ([mcp_servers.holographic-memory])
+Registers (or removes) the holographic-memory MCP server via:
+  claude mcp add --scope user   (writes ~/.claude.json)
+  codex mcp add                 (writes ~/.codex/config.toml)
+Falls back to direct file write when the CLI is unavailable.
+On install/uninstall, also cleans up any stale entry in
+~/.claude/settings.json left by setup-mcp ≤0.4.1.
 
 Options:
-  --print               Print snippets to stdout, no writes
-                        (with --uninstall: print "remove" instructions)
+  --print               Print the equivalent CLI commands to stdout, no writes
+                        (with --uninstall: print "remove" command lines)
   --dry-run             Show what would change, no writes
   --refresh             Rewrite entries even if already present (install-only)
   --uninstall           Remove the entry from both configs (mirror of install)
@@ -619,8 +1121,8 @@ Options:
   --retain true|false   retainEnabled in MCP mode (default: true)
   --min-trust <num>     minTrustScore (default: 0.3)
   --max-recall <num>    maxFactsPerRecall (default: 10)
-  --claude-config <p>   override ~/.claude/settings.json path
-  --codex-config <p>    override ~/.codex/config.toml path
+  --claude-config <p>   override ~/.claude.json path (also disables CLI shell-out)
+  --codex-config <p>    override ~/.codex/config.toml path (also disables CLI shell-out)
 `);
     return;
   }

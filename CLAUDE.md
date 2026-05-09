@@ -61,6 +61,16 @@ Both are produced by `pnpm build` from `src/manifest.ts` and `src/worker.ts`. Th
 
 Server logs are the load-bearing signal — `worker process started and initialized` + `registered N tool(s)` + `eventSubscriptions: N` confirm the plugin actually wired up. `status: "ready"` alone is **not** sufficient (this was PR #19's mistake). Tool round-trip via `POST /api/plugins/tools/execute` requires a seeded company+agent in the DB; see issue #22 for the smoke-script we need.
 
+### setup-mcp wiring (load-bearing)
+
+`scripts/setup-mcp.ts` registers the MCP server in two places. **Issue #34 background** (fixed in 0.5.0): older versions wrote to `~/.claude/settings.json` (Claude Code 1.x). Claude Code 2.x reads `~/.claude.json` (managed by `claude mcp add`); writes to `settings.json` are silently ignored. The script now:
+
+1. **CLI shell-out first**: prefers `claude mcp add --scope user` and `codex mcp add` — the canonical entry points that own the on-disk format. Verifies the entry actually persisted via a follow-up `mcp get` (catches "exit 0 but didn't write" failure modes documented in #34).
+2. **File-write fallback**: when the CLI is missing (ENOENT), falls back to the original direct-write path against `~/.claude.json` and `~/.codex/config.toml`. CLI-found-but-errored is a hard fail (don't fall back; that creates config drift between two locations).
+3. **Legacy migration**: every install/uninstall on the Claude scope cleans `mcpServers.holographic-memory` from `~/.claude/settings.json` if present. Tolerant of malformed JSON / bad shape — never blocks the install path on legacy file corruption.
+
+Tests inject a mock `ExecRunner` via `_setExecRunnerForTests` to cover the 11 CLI shell-out cases without spawning real `claude` / `codex` binaries. `--claude-config <path>` / `--codex-config <path>` overrides force the file-write path (the CLIs don't accept arbitrary config locations).
+
 ## Conventions
 
 - ESM only (`"type": "module"`); intra-package imports use `.js` extensions even though sources are `.ts` (e.g. `import { ... } from "./config.js"`).
