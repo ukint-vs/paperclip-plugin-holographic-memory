@@ -755,6 +755,64 @@ describe("MemoryStore", () => {
       expect(after).toBe(before);
     });
 
+    it("minTrust filters facts whose effective (decayed) trust drops below the threshold", () => {
+      // Fact has raw trust 0.7 — passes the SQL gate at minTrust=0.3 — but
+      // after 90d at halfLife=30 (3 half-lives) its effective trust is
+      // ~0.0875, well below the cutoff. Without the post-decay filter the
+      // fact would still surface; with it, search returns empty.
+      const dbPath = tempDbPath();
+      const store = new MemoryStore(dbPath);
+      stores.push(store);
+      const stale = store.addFact({ content: "alpha effective minTrust filter", trustScore: 0.7 });
+      const db = new Database(dbPath);
+      dbs.push(db);
+      db.prepare("UPDATE facts SET last_accessed_at = datetime('now', '-90 days') WHERE fact_id = ?")
+        .run(stale.factId);
+
+      const results = store.search("alpha effective minTrust filter", {
+        limit: 5,
+        minTrust: 0.3,
+        halfLifeDays: 30,
+      });
+      expect(results).toHaveLength(0);
+
+      // Same query with decay disabled returns the fact (raw trust 0.7 > 0.3).
+      const baseline = store.search("alpha effective minTrust filter", {
+        limit: 5,
+        minTrust: 0.3,
+        halfLifeDays: 0,
+      });
+      expect(baseline).toHaveLength(1);
+    });
+
+    it("related() applies the same effective-minTrust filter and tie-breakers as search()", () => {
+      const dbPath = tempDbPath();
+      const store = new MemoryStore(dbPath);
+      stores.push(store);
+      // Two related facts at trust 0.7; one is decayed past minTrust.
+      const stale = store.addFact({
+        content: '"BetaProtocol" stale entry',
+        trustScore: 0.7,
+      });
+      const fresh = store.addFact({
+        content: '"BetaProtocol" fresh entry',
+        trustScore: 0.7,
+      });
+      const db = new Database(dbPath);
+      dbs.push(db);
+      db.prepare("UPDATE facts SET last_accessed_at = datetime('now', '-90 days') WHERE fact_id = ?")
+        .run(stale.factId);
+
+      const results = store.related("BetaProtocol", {
+        limit: 5,
+        minTrust: 0.3,
+        halfLifeDays: 30,
+      });
+      // Stale fact (effective trust ~0.0875) filtered out; fresh remains.
+      expect(results.find((f) => f.factId === stale.factId)).toBeUndefined();
+      expect(results.find((f) => f.factId === fresh.factId)).toBeDefined();
+    });
+
     it("migration: legacy rows without last_accessed_at decay from created_at via COALESCE", () => {
       // Open a DB with the modern schema (so migrate() runs), insert a row,
       // then NULL out last_accessed_at and backdate created_at to simulate a

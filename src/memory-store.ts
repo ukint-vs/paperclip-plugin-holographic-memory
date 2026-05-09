@@ -36,11 +36,14 @@ interface FactRow {
 }
 
 // Internal scoring shape — vector + raw FTS rank carried through the
-// search pipeline, stripped before results leave the store.
+// search pipeline, stripped before results leave the store. effectiveTrust
+// holds trust × decay so the post-scoring filter honours the user's
+// minTrust against the same value that drives ranking.
 interface ScorableFact extends MemoryFact {
   hrrVector?: Float64Array;
   ftsRankRaw?: number;
   lastTouchedUnix?: number;
+  effectiveTrust?: number;
 }
 
 interface MemoryStoreOptions {
@@ -114,8 +117,14 @@ export class MemoryStore {
     const queryVector = this.hrrEnabled ? encodeText(query, this.hrrDim) : undefined;
     const nowSec = Date.now() / 1000;
 
+    // SQL gate (`COALESCE(trust_score, 0) >= minTrust`) is a cheap pre-filter
+    // on raw trust; with decay enabled, a fact whose effective trust has fallen
+    // below minTrust still passes that gate. Re-apply minTrust here against
+    // the post-decay value so users see "minTrust = effective trust" instead
+    // of "minTrust = baseline raw trust." (PR #30 review.)
     const scored = candidates
       .map((fact) => scoreFact(fact, queryTokens, queryVector, ftsLookup, halfLifeDays, nowSec))
+      .filter((fact) => (fact.effectiveTrust ?? fact.trustScore) >= minTrust)
       .sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || b.trustScore - a.trustScore || a.factId - b.factId)
       .slice(0, limit);
 
@@ -344,22 +353,30 @@ export class MemoryStore {
       )
       .all(...params) as FactRow[];
     const nowSec = Date.now() / 1000;
+    // Mirror search()'s post-decay minTrust filter and tie-breakers so
+    // related ranking is deterministic on score ties and respects the same
+    // "minTrust = effective trust" semantics. (PR #30 review.)
     const results = rows
       .map((row) => {
         const vector = bytesToPhases(row.hrr_vector ?? Buffer.alloc(0));
         const residual = unbind(vector, entityVector);
         const trust = row.trust_score ?? 0;
         const ageDays = ageDaysFromUnix(row.last_touched_unix, nowSec);
-        const score =
-          ((similarity(residual, roleContent) + 1) / 2) *
-          decayedTrust(trust, ageDays, halfLifeDays);
-        return { ...mapFactRow(row), score };
+        const effectiveTrust = decayedTrust(trust, ageDays, halfLifeDays);
+        const score = ((similarity(residual, roleContent) + 1) / 2) * effectiveTrust;
+        return { ...mapFactRow(row), effectiveTrust, score };
       })
-      .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+      .filter((fact) => fact.effectiveTrust >= minTrust)
+      .sort(
+        (a, b) =>
+          (b.score ?? 0) - (a.score ?? 0) ||
+          b.trustScore - a.trustScore ||
+          a.factId - b.factId,
+      )
       .slice(0, limit);
 
     this.incrementRetrievalCounts(results.map((fact) => fact.factId));
-    return results;
+    return results.map(({ effectiveTrust: _e, ...fact }) => fact);
   }
 
   listFacts(options: MemorySearchOptions & { category?: string } = {}): MemoryFact[] {
@@ -702,7 +719,7 @@ function mapFactRowWithVector(row: FactRow): ScorableFact {
 }
 
 function stripScoringFields(scorable: ScorableFact): MemoryFact {
-  const { hrrVector: _v, ftsRankRaw: _r, lastTouchedUnix: _t, ...rest } = scorable;
+  const { hrrVector: _v, ftsRankRaw: _r, lastTouchedUnix: _t, effectiveTrust: _e, ...rest } = scorable;
   return rest;
 }
 
@@ -864,5 +881,6 @@ function scoreFact(
   const relevance = 0.4 * fts + 0.3 * jaccard + 0.3 * hrr;
 
   const ageDays = ageDaysFromUnix(fact.lastTouchedUnix, nowSec);
-  return { ...fact, score: relevance * decayedTrust(fact.trustScore, ageDays, halfLifeDays) };
+  const effectiveTrust = decayedTrust(fact.trustScore, ageDays, halfLifeDays);
+  return { ...fact, effectiveTrust, score: relevance * effectiveTrust };
 }
