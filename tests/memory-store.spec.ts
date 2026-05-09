@@ -813,6 +813,51 @@ describe("MemoryStore", () => {
       expect(results.find((f) => f.factId === fresh.factId)).toBeDefined();
     });
 
+    it("over-fetches candidates when decay is enabled so stale top-rank matches don't starve fresh matches", () => {
+      // Codex PR review caught: with halfLifeDays=0 the SQL pre-fetch caps at
+      // limit*3 candidates, which is fine. With decay on and many top-rank
+      // matches stale, that cap can wipe the entire candidate pool via the
+      // post-decay filter — fresh rows beyond the cap never get a chance.
+      // Verify search returns the fresh rows when 30 stale ones come first
+      // in FTS rank order with a limit of 5.
+      const dbPath = tempDbPath();
+      const store = new MemoryStore(dbPath);
+      stores.push(store);
+
+      const staleIds: number[] = [];
+      for (let i = 0; i < 30; i += 1) {
+        staleIds.push(
+          store.addFact({ content: `stale candidate alpha bravo ${i}`, trustScore: 0.7 }).factId,
+        );
+      }
+      const freshIds: number[] = [];
+      for (let i = 0; i < 5; i += 1) {
+        freshIds.push(
+          store.addFact({ content: `fresh candidate alpha bravo ${i}`, trustScore: 0.7 }).factId,
+        );
+      }
+
+      const db = new Database(dbPath);
+      dbs.push(db);
+      const placeholders = staleIds.map(() => "?").join(",");
+      db.prepare(
+        `UPDATE facts SET last_accessed_at = datetime('now', '-365 days') WHERE fact_id IN (${placeholders})`,
+      ).run(...staleIds);
+
+      const results = store.search("alpha bravo", {
+        limit: 5,
+        minTrust: 0.3,
+        halfLifeDays: 30,
+      });
+      // All 5 fresh rows should be returned. Without the wider candidate
+      // pool, the top-15 (limit*3) would have been the stale rows, all
+      // filtered out, and `results` would have been empty.
+      expect(results).toHaveLength(5);
+      for (const r of results) {
+        expect(freshIds).toContain(r.factId);
+      }
+    });
+
     it("migration: legacy rows without last_accessed_at decay from created_at via COALESCE", () => {
       // Open a DB with the modern schema (so migrate() runs), insert a row,
       // then NULL out last_accessed_at and backdate created_at to simulate a

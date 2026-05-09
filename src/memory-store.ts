@@ -93,8 +93,16 @@ export class MemoryStore {
       return [];
     }
 
-    const byText = this.searchFts(ftsQuery, limit * 3, minTrust, companyId);
-    const remaining = Math.max(0, limit * 3 - byText.length);
+    // Over-fetch headroom for the candidate pool. With decay disabled, a 3x
+    // multiplier is enough to give scoreFact some reordering room over the
+    // SQL ORDER BY. With decay enabled, the post-scoring filter can discard
+    // every stale candidate above the cutoff — if the top-`limit*3` rows by
+    // FTS rank happen to all be stale, search returns 0 even when fresh rows
+    // beyond the cap would qualify. Bumping to 10x makes that collapse far
+    // less likely without pulling in unbounded rows. (PR #30 Codex review.)
+    const candidateMultiplier = halfLifeDays > 0 ? 10 : 3;
+    const byText = this.searchFts(ftsQuery, limit * candidateMultiplier, minTrust, companyId);
+    const remaining = Math.max(0, limit * candidateMultiplier - byText.length);
 
     const byEntity = this.searchEntities(query, remaining, minTrust, companyId);
     // FTS branch wins on collision: it carries both the vector and the rank.
