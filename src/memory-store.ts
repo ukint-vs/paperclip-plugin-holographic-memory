@@ -48,6 +48,15 @@ interface MemoryStoreOptions {
   hrrDim?: number;
 }
 
+// Epoch seconds for the fact's "last touched" moment, used by the JS-side
+// decay computation. last_accessed_at falls back to created_at so legacy
+// rows still age coherently. Three SELECTs (FTS branch, entity branch,
+// related) project it identically; `prefix` lets the SQL choose between
+// the joined alias (`f.`) and the unaliased table.
+function lastTouchedUnixSql(prefix: "" | "f." = ""): string {
+  return `COALESCE(unixepoch(${prefix}last_accessed_at), unixepoch(${prefix}created_at)) AS last_touched_unix`;
+}
+
 export class MemoryStore {
   readonly dbPath: string;
   private readonly db: Database.Database;
@@ -327,7 +336,7 @@ export class MemoryStore {
       .prepare(
         `SELECT fact_id, content, category, tags, trust_score, retrieval_count, helpful_count, hrr_vector,
                 source, agent_id, run_id, company_id,
-                COALESCE(unixepoch(last_accessed_at), unixepoch(created_at)) AS last_touched_unix
+                ${lastTouchedUnixSql()}
          FROM facts
          WHERE hrr_vector IS NOT NULL
            AND COALESCE(trust_score, 0) >= ?
@@ -388,32 +397,21 @@ export class MemoryStore {
     const oldTrust = row.trust_score;
     const newTrust = normalizeTrust(oldTrust + (helpful ? 0.05 : -0.1));
     const helpfulIncrement = helpful ? 1 : 0;
-    // Positive feedback also resets the decay clock — the user told us this
-    // fact is still good. Negative feedback does NOT bump last_accessed_at:
-    // a freshly-penalised fact should still age cleanly so the penalty
-    // doesn't get diluted by a "last touched" reset.
-    if (helpful) {
-      this.db
-        .prepare(
-          `UPDATE facts
-           SET trust_score = ?,
-               helpful_count = helpful_count + ?,
-               updated_at = CURRENT_TIMESTAMP,
-               last_accessed_at = CURRENT_TIMESTAMP
-           WHERE fact_id = ?`
-        )
-        .run(newTrust, helpfulIncrement, factId);
-    } else {
-      this.db
-        .prepare(
-          `UPDATE facts
-           SET trust_score = ?,
-               helpful_count = helpful_count + ?,
-               updated_at = CURRENT_TIMESTAMP
-           WHERE fact_id = ?`
-        )
-        .run(newTrust, helpfulIncrement, factId);
-    }
+    // Positive feedback resets the decay clock — the user told us this fact
+    // is still good. Negative feedback leaves last_accessed_at alone so a
+    // freshly-penalised fact still ages cleanly and the penalty isn't
+    // diluted by a "last touched" reset. The CASE WHEN keeps both paths in
+    // one prepared statement.
+    this.db
+      .prepare(
+        `UPDATE facts
+         SET trust_score = ?,
+             helpful_count = helpful_count + ?,
+             updated_at = CURRENT_TIMESTAMP,
+             last_accessed_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE last_accessed_at END
+         WHERE fact_id = ?`
+      )
+      .run(newTrust, helpfulIncrement, helpful ? 1 : 0, factId);
 
     return {
       factId,
@@ -463,7 +461,7 @@ export class MemoryStore {
       .prepare(
         `SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score, f.retrieval_count,
                 f.helpful_count, f.hrr_vector, f.source, f.agent_id, f.run_id, f.company_id,
-                COALESCE(unixepoch(f.last_accessed_at), unixepoch(f.created_at)) AS last_touched_unix,
+                ${lastTouchedUnixSql("f.")},
                 facts_fts.rank AS fts_rank_raw
          FROM facts_fts
          JOIN facts f ON facts_fts.rowid = f.fact_id
@@ -493,7 +491,7 @@ export class MemoryStore {
     const stmt = this.db.prepare(
       `SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score, f.retrieval_count,
               f.helpful_count, f.hrr_vector, f.source, f.agent_id, f.run_id, f.company_id,
-              COALESCE(unixepoch(f.last_accessed_at), unixepoch(f.created_at)) AS last_touched_unix
+              ${lastTouchedUnixSql("f.")}
        FROM facts f
        JOIN fact_entities fe ON f.fact_id = fe.fact_id
        JOIN entities e ON fe.entity_id = e.entity_id
