@@ -18,6 +18,17 @@ Persistent, cross-run memory for agents via `holographic_memory_search`. An isol
 
 ## When to use
 
+> **CRITICAL — DO THIS FIRST.**
+> Before loading the `paperclip` skill, before reading HEARTBEAT.md, before any tool calls whatsoever:
+> ```
+> mcp__holographic-memory__holographic_memory_search
+> action: "recall_context"
+> ```
+> If your adapter uses a different tool name, find the `holographic_memory_search` tool and call it with `action: "recall_context"`.
+> **Failure to call this means you have no memory between runs.** You will repeat mistakes, forget conventions, and ask the user questions you should already know the answer to.
+>
+> After you get the MEMORY CONTEXT back, then proceed with your normal Paperclip heartbeat.
+
 **Mandatory — at the START of every run, before any work:**
 - Call `recall_context` with your run_id, issue_id, and agent_id to get a briefing of relevant facts.
 
