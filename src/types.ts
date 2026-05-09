@@ -20,11 +20,17 @@ export interface MemoryFact {
   source: string | null;
   agentId: string | null;
   runId: string | null;
+  // Cross-tenant scoping. NULL = global (visible to all companies);
+  // populated rows are isolated to their writing company.
+  companyId: string | null;
 }
 
 export interface MemorySearchOptions {
   limit?: number;
   minTrust?: number;
+  // Scope reads to this company plus NULL (global) rows. Omit only
+  // for trusted server-side audits.
+  companyId?: string;
 }
 
 export interface NewMemoryFact {
@@ -35,6 +41,7 @@ export interface NewMemoryFact {
   source?: string;
   agentId?: string;
   runId?: string;
+  companyId?: string;
 }
 
 // Shared envelope shape duck-typed from `agent.run.started` and

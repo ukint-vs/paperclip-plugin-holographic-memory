@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Removed
+- `AddFactResult.reason` and the `content_collision` catch branch in
+  `addFact`. These were a safety valve for cross-tenant content
+  collisions that can only fire under multi-tenant misuse on a shared
+  `dbPath`. Single-tenant runs are guaranteed-safe by the dedup SELECT
+  before INSERT. Closed issues #9 (schema migration framework) and #28
+  (MCP cross-tenant scoping) as deferred-pending-multi-tenant; reopen
+  alongside the second company onboarding.
+
+### Added
+- Cross-tenant scoping (#3). New `company_id TEXT` column on `facts` via the same idempotent `ALTER TABLE` shim used for provenance in 0.2.0. Every read SELECT in the store filters by `(company_id = ? OR company_id IS NULL)` when a `companyId` is supplied; NULL = global so existing curated/seed rows keep working without a backfill. `addFact` writes `company_id`, scopes dedup per-company, and catches the residual `UNIQUE`-on-content collision (returning `inserted: false, reason: "content_collision"`) instead of leaking another company's `fact_id`. Worker pass-through wired end-to-end: `event.companyId` reaches recall + auto-extract; `runCtx.companyId` reaches every dispatch handler (search/probe/related/reason/list/recall_context/add) via the `CoreActionHandler` signature.
+- Recall observability (#7). `handleRunStarted` now emits structured logs on every exit path: `recall: fired` (with `facts`, `avgScore`, `maxScore`, `avgTrust`, `scopesWritten`, `scopesFailed`, `elapsedMs`, plus run/issue/agent/company IDs), `recall: skipped` with a `reason` enum (`disabled` / `missing_issue_id` / `empty_issue` / `no_facts`), plus error/warn lines for issue-fetch / search / partial-and-all scope-write failures. From server logs alone you can now answer "did recall contribute, and if not, why" without inspecting plugin state.
+- Per-recall aggregates (`avgScore`, `maxScore`, `avgTrust`) computed in a single pass over the returned facts.
+
+### Changed
+- `MemoryFact` gains a required `companyId: string | null` field. Internal change for plugin authors who construct fact literals; the plugin itself ships only the runtime, so no npm-consumer breakage.
+- `MemorySearchOptions` gains an optional `companyId?: string`; omit for trusted server-side audits, supply otherwise.
+- `NewMemoryFact` gains an optional `companyId?: string`.
+- `AddFactResult` gains an optional `reason?: "content_collision"` for the cross-tenant write edge case.
+- `CoreActionHandler` (in `dispatch.ts`) gains an optional `runCtx?: ToolRunContext` parameter; the standalone MCP server still calls it with no `runCtx` (no `companyId` in MCP world today).
+- Per-scope writes use `Promise.allSettled` instead of `Promise.all`. A single rejected scope no longer kills the whole handler; partial success still returns recall state and emits a `warn`.
+
+### Fixed
+- `Promise.all` over the per-scope writes in `handleRunStarted` previously rejected the whole handler if any one scope rejected. Now logged as either `partial scope write failure` (warn, state still returned) or `all scope writes failed` (error, undefined returned).
+
 ## [0.3.0] - 2026-05-09
 ### Added
 - Stdio MCP server (`paperclip-holographic-memory-mcp` bin) bridging the memory tool to `claude_local` and `codex_local` agents (issue #20). Surfaces `holographic_memory_search` over MCP for any client that speaks the protocol.

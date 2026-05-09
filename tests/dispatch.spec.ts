@@ -1,12 +1,15 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   closeStores,
   dispatchStandaloneAction,
   getStore,
+  handleAdd,
+  handleSearch,
 } from "../src/dispatch.js";
 import { writeRecallCache } from "../src/recall-cache.js";
-import type { RecallState } from "../src/types.js";
-import { baseConfig, tempDb } from "./helpers.js";
+import type { HolographicMemoryConfig, RecallState } from "../src/types.js";
+import { baseConfig, fakeRunCtx, tempDb } from "./helpers.js";
+import type { MemoryStore } from "../src/memory-store.js";
 
 afterEach(() => {
   closeStores();
@@ -172,5 +175,60 @@ describe("dispatchStandaloneAction — recall_context (A3)", () => {
     const config = baseConfig(tempDb());
     const result = await dispatchStandaloneAction({ action: "recall_context", run_id: "no-such-run" }, config);
     expect(result.data).toEqual({ mode: "standalone", cached: false });
+  });
+});
+
+describe("CoreActionHandler — companyId pass-through", () => {
+  // The Paperclip worker passes runCtx into each handler via adaptCore;
+  // the standalone MCP server passes no runCtx (companyId is undefined).
+  // These tests pin both shapes at the dispatch layer so the cross-tenant
+  // path can't silently regress when the dispatch refactor is touched again.
+  let config: HolographicMemoryConfig;
+  let store: MemoryStore;
+
+  beforeEach(() => {
+    config = baseConfig(tempDb());
+    store = getStore(config);
+  });
+
+  it("handleSearch with runCtx.companyId scopes to that company plus NULL", async () => {
+    store.addFact({ content: "Co-A only fact about widgets", companyId: "co-A" });
+    store.addFact({ content: "Co-B only fact about widgets", companyId: "co-B" });
+    store.addFact({ content: "Global fact about widgets" });
+
+    const result = await handleSearch(
+      store,
+      { query: "widgets", min_trust: 0 },
+      config,
+      fakeRunCtx("co-A"),
+    );
+
+    expect(result.content).toContain("Co-A only fact");
+    expect(result.content).toContain("Global fact");
+    expect(result.content).not.toContain("Co-B only fact");
+  });
+
+  it("handleSearch with no runCtx (MCP standalone shape) sees every company", async () => {
+    store.addFact({ content: "Co-A widget fact", companyId: "co-A" });
+    store.addFact({ content: "Co-B widget fact", companyId: "co-B" });
+
+    const result = await handleSearch(store, { query: "widget", min_trust: 0 }, config);
+
+    expect(result.content).toContain("Co-A widget fact");
+    expect(result.content).toContain("Co-B widget fact");
+  });
+
+  it("handleAdd persists runCtx.companyId on the new fact", async () => {
+    const result = await handleAdd(
+      store,
+      { content: "stored under co-A scope" },
+      config,
+      fakeRunCtx("co-A"),
+    );
+    const data = JSON.parse(result.content) as { factId: number };
+
+    const [persisted] = store.search("stored under", { limit: 1, minTrust: 0 });
+    expect(persisted?.factId).toBe(data.factId);
+    expect(persisted?.companyId).toBe("co-A");
   });
 });

@@ -122,30 +122,74 @@ export async function handleRunStarted(
   event: AgentRunEvent,
   config: HolographicMemoryConfig
 ): Promise<RecallState | undefined> {
-  if (!config.recallEnabled || !event.issueId) {
+  const startedAt = Date.now();
+  const elapsed = (): number => Date.now() - startedAt;
+  const eventIds = {
+    runId: event.runId,
+    issueId: event.issueId,
+    agentId: event.agentId,
+    companyId: event.companyId
+  };
+  const skip = (reason: string): undefined => {
+    ctx.logger?.info?.("recall: skipped", { reason, ...eventIds, elapsedMs: elapsed() });
     return undefined;
-  }
+  };
+
+  if (!config.recallEnabled) return skip("disabled");
+  if (!event.issueId) return skip("missing_issue_id");
 
   // companyId is on the PluginEvent envelope (PLUGIN_SPEC §16) and required
   // by issues.get; passing undefined makes the SDK return null and silently
   // disables automated recall. Fall back to ctx.companyId only for tests.
   const companyId = event.companyId ?? (ctx as any).companyId;
-  const issue = await ctx.issues?.get?.(event.issueId, companyId);
+
+  let issue: unknown;
+  try {
+    issue = await ctx.issues?.get?.(event.issueId, companyId);
+  } catch (error) {
+    ctx.logger?.error?.("recall: issue fetch failed", {
+      ...eventIds,
+      elapsedMs: elapsed(),
+      error: error instanceof Error ? error.message : String(error)
+    });
+    return undefined;
+  }
   const query = joinIssueText(issue);
 
-  if (!query.trim()) {
-    return undefined;
-  }
+  if (!query.trim()) return skip("empty_issue");
 
   const store = getStore(config);
-  const facts = store.search(query, {
-    limit: config.maxFactsPerRecall,
-    minTrust: config.minTrustScore
-  });
-
-  if (!facts.length) {
+  let facts;
+  try {
+    facts = store.search(query, {
+      limit: config.maxFactsPerRecall,
+      minTrust: config.minTrustScore,
+      ...(companyId ? { companyId } : {})
+    });
+  } catch (error) {
+    ctx.logger?.error?.("recall: search failed", {
+      ...eventIds,
+      elapsedMs: elapsed(),
+      error: error instanceof Error ? error.message : String(error)
+    });
     return undefined;
   }
+
+  if (!facts.length) return skip("no_facts");
+
+  const round3 = (n: number): number => Math.round(n * 1000) / 1000;
+  let sumScore = 0;
+  let maxScoreRaw = 0;
+  let sumTrust = 0;
+  for (const fact of facts) {
+    const score = fact.score ?? 0;
+    sumScore += score;
+    if (score > maxScoreRaw) maxScoreRaw = score;
+    sumTrust += fact.trustScore;
+  }
+  const avgScore = round3(sumScore / facts.length);
+  const maxScore = round3(maxScoreRaw);
+  const avgTrust = round3(sumTrust / facts.length);
 
   const state: RecallState = {
     query,
@@ -159,18 +203,58 @@ export async function handleRunStarted(
 
   // Write the same recall payload under every available scope so any of
   // run/issue/agent (whichever the agent later asks about) resolves.
-  // The Paperclip SDK already namespaces state by (scopeKind, scopeId),
-  // so we don't need a separate "latest" pointer — runCtx.runId on a tool
-  // call is authoritative.
-  await Promise.all(
-    [
-      event.runId ? scopeFor("run", event.runId) : undefined,
-      event.issueId ? scopeFor("issue", event.issueId) : undefined,
-      event.agentId ? scopeFor("agent", event.agentId) : undefined
-    ]
-      .filter((s): s is ScopeKey => s !== undefined)
-      .map((scope) => writeScopeState(ctx, scope, state))
+  // allSettled (not all): one rejected scope must not silently drop
+  // recall state for the other two — partial success is still useful.
+  const scopeTargets: Array<{ kind: "run" | "issue" | "agent"; scope: ScopeKey }> = [];
+  if (event.runId) scopeTargets.push({ kind: "run", scope: scopeFor("run", event.runId) });
+  if (event.issueId) scopeTargets.push({ kind: "issue", scope: scopeFor("issue", event.issueId) });
+  if (event.agentId) scopeTargets.push({ kind: "agent", scope: scopeFor("agent", event.agentId) });
+
+  const settled = await Promise.allSettled(
+    scopeTargets.map((t) => writeScopeState(ctx, t.scope, state))
   );
+  const scopesWritten: string[] = [];
+  const scopesFailed: string[] = [];
+  settled.forEach((result, i) => {
+    const target = scopeTargets[i];
+    if (!target) return;
+    if (result.status === "fulfilled") {
+      scopesWritten.push(target.kind);
+    } else {
+      scopesFailed.push(target.kind);
+    }
+  });
+
+  if (scopeTargets.length > 0 && scopesWritten.length === 0) {
+    ctx.logger?.error?.("recall: all scope writes failed", {
+      ...eventIds,
+      elapsedMs: elapsed(),
+      scopesFailed,
+      facts: facts.length
+    });
+    return undefined;
+  }
+  if (scopesFailed.length > 0) {
+    ctx.logger?.warn?.("recall: partial scope write failure", {
+      ...eventIds,
+      elapsedMs: elapsed(),
+      scopesWritten,
+      scopesFailed
+    });
+  }
+
+  ctx.logger?.info?.("recall: fired", {
+    facts: facts.length,
+    avgScore,
+    maxScore,
+    avgTrust,
+    minTrust: config.minTrustScore,
+    limit: config.maxFactsPerRecall,
+    scopesWritten,
+    scopesFailed,
+    ...eventIds,
+    elapsedMs: elapsed()
+  });
 
   // Mirror to the on-disk recall cache so the standalone MCP server (claude_local
   // / codex_local subprocesses) can resolve recall_context across processes.
@@ -292,6 +376,7 @@ export async function handleRunFinished(
           };
           if (agentId) fact.agentId = agentId;
           if (runId) fact.runId = runId;
+          if (companyId) fact.companyId = companyId;
           const result = store.addFact(fact);
           if (result.inserted) insertedCount += 1;
         } catch (err) {
@@ -399,10 +484,15 @@ async function handleRecallContext(
   }
 
   if (params.query?.trim()) {
-    const facts = store.search(params.query, {
+    // recall_context's live-search fallback uses maxFactsPerRecall (not the
+    // dispatch read-handler default of 5) so the cached-vs-search split
+    // behaves consistently. companyId scoping mirrors the dispatch path.
+    const opts: { limit: number; minTrust: number; companyId?: string } = {
       limit: params.limit ?? config.maxFactsPerRecall,
       minTrust: params.min_trust ?? config.minTrustScore
-    });
+    };
+    if (runCtx?.companyId) opts.companyId = runCtx.companyId;
+    const facts = store.search(params.query, opts);
     return { content: formatFactsAsText(facts) };
   }
 
@@ -414,9 +504,11 @@ async function handleRecallContext(
 
 // Adapter that bridges a CoreActionHandler (which returns a DispatchToolResult)
 // into the ctx-aware ActionHandler shape expected by the worker dispatch.
+// Forwards `runCtx` so cross-tenant scoping (companyId) reaches the core
+// handlers — the standalone MCP server passes runCtx: undefined.
 function adaptCore(handler: CoreActionHandler): CtxActionHandler {
-  return async (store, params, config) => {
-    const result = await handler(store, params, config);
+  return async (store, params, config, _ctx, runCtx) => {
+    const result = await handler(store, params, config, runCtx);
     // DispatchToolResult and ToolResult are structurally identical for our
     // purposes (content + optional data + optional error). The cast keeps
     // the SDK type contract without re-allocating.

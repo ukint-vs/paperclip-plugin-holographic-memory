@@ -3,6 +3,7 @@
 // worker.ts; everything else routes through here so the MCP server can reuse
 // the exact same store and handler logic.
 
+import type { ToolRunContext } from "@paperclipai/plugin-sdk";
 import { formatFactsAsText } from "./context-injector.js";
 import { MemoryStore } from "./memory-store.js";
 import { readRecallCache, type RecallCacheScope } from "./recall-cache.js";
@@ -36,11 +37,32 @@ export interface DispatchToolResult {
   error?: string;
 }
 
+// runCtx is optional so the standalone MCP server (no Paperclip envelope)
+// can call core handlers with `(store, params, config)`. When present, its
+// companyId scopes reads/writes for cross-tenant isolation.
 export type CoreActionHandler = (
   store: MemoryStore,
   params: ToolParams,
-  config: HolographicMemoryConfig
+  config: HolographicMemoryConfig,
+  runCtx?: ToolRunContext
 ) => Promise<DispatchToolResult>;
+
+// Build the read-side options shared by every search-style handler.
+// Cross-tenant scoping piggybacks on this: every read path scopes to the
+// caller's company (plus NULL = global rows), so two companies sharing a
+// dbPath cannot see each other's facts.
+function readOptions(
+  params: ToolParams,
+  config: HolographicMemoryConfig,
+  runCtx?: ToolRunContext
+): { limit: number; minTrust: number; companyId?: string } {
+  const opts: { limit: number; minTrust: number; companyId?: string } = {
+    limit: params.limit ?? 5,
+    minTrust: params.min_trust ?? config.minTrustScore
+  };
+  if (runCtx?.companyId) opts.companyId = runCtx.companyId;
+  return opts;
+}
 
 export const READ_ACTIONS = new Set([
   "search",
@@ -86,66 +108,57 @@ export function closeStores(): void {
 export async function handleSearch(
   store: MemoryStore,
   params: ToolParams,
-  config: HolographicMemoryConfig
+  config: HolographicMemoryConfig,
+  runCtx?: ToolRunContext
 ): Promise<DispatchToolResult> {
   if (!params.query?.trim()) return err("Missing required parameter: query");
-  const facts = store.search(params.query, {
-    limit: params.limit ?? 5,
-    minTrust: params.min_trust ?? config.minTrustScore
-  });
+  const facts = store.search(params.query, readOptions(params, config, runCtx));
   return { content: formatFactsAsText(facts) };
 }
 
 export async function handleProbe(
   store: MemoryStore,
   params: ToolParams,
-  config: HolographicMemoryConfig
+  config: HolographicMemoryConfig,
+  runCtx?: ToolRunContext
 ): Promise<DispatchToolResult> {
   if (!params.entity?.trim()) return err("Missing required parameter: entity");
-  const facts = store.probe(params.entity, {
-    limit: params.limit ?? 5,
-    minTrust: params.min_trust ?? config.minTrustScore
-  });
+  const facts = store.probe(params.entity, readOptions(params, config, runCtx));
   return { content: formatFactsAsText(facts) };
 }
 
 export async function handleRelated(
   store: MemoryStore,
   params: ToolParams,
-  config: HolographicMemoryConfig
+  config: HolographicMemoryConfig,
+  runCtx?: ToolRunContext
 ): Promise<DispatchToolResult> {
   if (!params.entity?.trim()) return err("Missing required parameter: entity");
-  const facts = store.related(params.entity, {
-    limit: params.limit ?? 5,
-    minTrust: params.min_trust ?? config.minTrustScore
-  });
+  const facts = store.related(params.entity, readOptions(params, config, runCtx));
   return { content: formatFactsAsText(facts) };
 }
 
 export async function handleReason(
   store: MemoryStore,
   params: ToolParams,
-  config: HolographicMemoryConfig
+  config: HolographicMemoryConfig,
+  runCtx?: ToolRunContext
 ): Promise<DispatchToolResult> {
   if (!Array.isArray(params.entities) || params.entities.length === 0) {
     return err("Missing required parameter: entities");
   }
-  const facts = store.reason(params.entities, {
-    limit: params.limit ?? 5,
-    minTrust: params.min_trust ?? config.minTrustScore
-  });
+  const facts = store.reason(params.entities, readOptions(params, config, runCtx));
   return { content: formatFactsAsText(facts) };
 }
 
 export async function handleList(
   store: MemoryStore,
   params: ToolParams,
-  config: HolographicMemoryConfig
+  config: HolographicMemoryConfig,
+  runCtx?: ToolRunContext
 ): Promise<DispatchToolResult> {
-  const options: { limit: number; minTrust: number; category?: string } = {
-    limit: params.limit ?? 5,
-    minTrust: params.min_trust ?? config.minTrustScore
-  };
+  const base = readOptions(params, config, runCtx);
+  const options: { limit: number; minTrust: number; category?: string; companyId?: string } = { ...base };
   if (params.category) options.category = params.category;
   const facts = store.listFacts(options);
   return { content: JSON.stringify({ facts, count: facts.length }), data: { facts, count: facts.length } };
@@ -164,7 +177,9 @@ export async function handleFeedback(
 
 export async function handleAdd(
   store: MemoryStore,
-  params: ToolParams
+  params: ToolParams,
+  _config: HolographicMemoryConfig,
+  runCtx?: ToolRunContext
 ): Promise<DispatchToolResult> {
   if (typeof params.content !== "string" || !params.content.trim()) {
     return err("Missing required parameter: content");
@@ -173,6 +188,7 @@ export async function handleAdd(
   if (typeof params.category === "string") fact.category = params.category;
   if (params.tags !== undefined) fact.tags = params.tags;
   if (typeof params.trust_score === "number") fact.trustScore = params.trust_score;
+  if (runCtx?.companyId) fact.companyId = runCtx.companyId;
   const result = store.addFact(fact);
   return { content: JSON.stringify(result), data: result };
 }
