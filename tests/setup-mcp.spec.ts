@@ -495,13 +495,11 @@ function cliDefaults(): CliOptions {
 }
 
 function expectedEnvLines(): string {
-  return [
-    "PAPERCLIP_HOLO_MEMORY_DB=/tmp/h.db",
-    "PAPERCLIP_HOLO_MEMORY_RECALL_ENABLED=true",
-    "PAPERCLIP_HOLO_MEMORY_RETAIN_ENABLED=true",
-    "PAPERCLIP_HOLO_MEMORY_MIN_TRUST=0.3",
-    "PAPERCLIP_HOLO_MEMORY_MAX_RECALL=10",
-  ].join("\n");
+  // Derive from the live builder so adding/renaming env vars doesn't drift.
+  const args = buildClaudeMcpAddArgs(cliDefaults());
+  return args
+    .filter((_, i) => args[i - 1] === "--env")
+    .join("\n");
 }
 
 describe("buildClaudeMcpAddArgs", () => {
@@ -708,37 +706,19 @@ describe("applyClaudeViaCli", () => {
     expect(result!.reason).toMatch(/scope mismatch/);
   });
 
-  it("refresh=true with server absent: remove returns 'not found' → still proceeds with add", async () => {
-    let probeCount = 0;
+  it("refresh=true with stale entry: remove returns 'not found' → still proceeds with add", async () => {
+    // Trigger the remove-not-found path: entry must be present at first probe
+    // (so willChange triggers remove) but the remove call fails with "not found"
+    // (a race or scope quirk). The code should swallow that and proceed to add.
     const runner: ExecRunner = async (cmd, args) => {
       if (args[0] === "--version") return { code: 0, stdout: "claude 2.0.0", stderr: "" };
-      if (args[1] === "get") {
-        probeCount++;
-        if (probeCount === 1) return { code: 1, stdout: "", stderr: "" };
-        return { code: 0, stdout: `Scope: User config\n${expectedEnvLines()}`, stderr: "" };
-      }
-      if (args[1] === "remove") return { code: 1, stdout: "", stderr: "No MCP server named 'holographic-memory' not found." };
-      if (args[1] === "add") return { code: 0, stdout: "added", stderr: "" };
-      return { code: 0, stdout: "", stderr: "" };
-    };
-    _setExecRunnerForTests(runner);
-    // Server absent on initial probe + refresh=true: code path skips remove (only present-and-willChange triggers it)
-    // To trigger the remove-not-found path, we need server present + refresh.
-    const opts = { ...cliDefaults(), refresh: true };
-    let probeCount2 = 0;
-    const runner2: ExecRunner = async (cmd, args) => {
-      if (args[0] === "--version") return { code: 0, stdout: "claude 2.0.0", stderr: "" };
-      if (args[1] === "get") {
-        probeCount2++;
-        if (probeCount2 === 1) return { code: 0, stdout: `Scope: User config\n${expectedEnvLines()}`, stderr: "" };
-        return { code: 0, stdout: `Scope: User config\n${expectedEnvLines()}`, stderr: "" };
-      }
+      if (args[1] === "get") return { code: 0, stdout: `Scope: User config\n${expectedEnvLines()}`, stderr: "" };
       if (args[1] === "remove") return { code: 1, stdout: "", stderr: "not found" };
       if (args[1] === "add") return { code: 0, stdout: "added", stderr: "" };
       return { code: 0, stdout: "", stderr: "" };
     };
-    _setExecRunnerForTests(runner2);
-    const result = await applyClaudeViaCli(opts);
+    _setExecRunnerForTests(runner);
+    const result = await applyClaudeViaCli({ ...cliDefaults(), refresh: true });
     expect(result!.changed).toBe(true);
   });
 
@@ -929,45 +909,81 @@ describe("applyCodexUninstallViaCli", () => {
 });
 
 describe("migrateLegacyClaudeSettings", () => {
-  let tmpHome: string;
-  let originalHomedir: typeof homedir;
-  // We cannot easily mock homedir() here because the constant LEGACY_CLAUDE_SETTINGS_PATH
-  // is captured at module-load time. Instead, we test the helper by writing to the
-  // ACTUAL legacy path in a sandboxed fashion: skip the test when ~/.claude/settings.json
-  // exists with content we don't recognize, otherwise create + clean up.
-  // Better: extract a path-injectable signature. For this PR, test against tmpdir
-  // by calling the helper through a wrapper that respects an env override.
+  let tmpDir: string;
+  let target: string;
 
   beforeEach(() => {
-    tmpHome = mkdtempSync(path.join(tmpdir(), "setupmcp-test-"));
-    originalHomedir = homedir;
+    tmpDir = mkdtempSync(path.join(tmpdir(), "setupmcp-migrate-"));
+    target = path.join(tmpDir, "settings.json");
   });
 
   afterEach(() => {
-    rmSync(tmpHome, { recursive: true, force: true });
+    rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  // The migration helper reads LEGACY_CLAUDE_SETTINGS_PATH (resolved at module load),
-  // which is ~/.claude/settings.json on the real homedir. We can't redirect that
-  // at runtime without restructuring. Test the migrate logic via mergeClaudeUninstall
-  // (already covered) + smoke-test the wrapper behaviors.
+  it("missing file → no-change", async () => {
+    const result = await migrateLegacyClaudeSettings(false, target);
+    expect(result.changed).toBe(false);
+    expect(result.reason).toMatch(/no legacy settings.json/);
+  });
 
-  it("smoke: returns no-change reason when run against the real legacy path with no entry", async () => {
-    // This test is environment-dependent. If the user's actual ~/.claude/settings.json
-    // contains a holographic-memory entry, this test will be skipped to avoid mutation.
-    const realLegacy = path.join(homedir(), ".claude", "settings.json");
-    let shouldSkip = false;
-    try {
-      const content = readFileSync(realLegacy, "utf8");
-      if (content.includes('"holographic-memory"')) shouldSkip = true;
-    } catch {
-      // no file → safe to test
-    }
-    if (shouldSkip) {
-      expect(true).toBe(true); // intentional pass
-      return;
-    }
-    const result = await migrateLegacyClaudeSettings(true /* dryRun */);
+  it("removes our entry while preserving siblings", async () => {
+    writeFileSync(
+      target,
+      JSON.stringify({
+        permissions: { defaultMode: "auto" },
+        mcpServers: {
+          "holographic-memory": { command: "npx", args: ["x"] },
+          "code-review-graph": { command: "uvx", args: ["code-review-graph", "serve"] },
+        },
+      }),
+    );
+    const result = await migrateLegacyClaudeSettings(false, target);
+    expect(result.changed).toBe(true);
+    const after = JSON.parse(readFileSync(target, "utf8"));
+    expect(after.mcpServers).toEqual({
+      "code-review-graph": { command: "uvx", args: ["code-review-graph", "serve"] },
+    });
+    expect(after.permissions.defaultMode).toBe("auto");
+  });
+
+  it("drops empty mcpServers when our entry was the only one", async () => {
+    writeFileSync(
+      target,
+      JSON.stringify({ mcpServers: { "holographic-memory": { command: "npx" } } }),
+    );
+    const result = await migrateLegacyClaudeSettings(false, target);
+    expect(result.changed).toBe(true);
+    const after = JSON.parse(readFileSync(target, "utf8"));
+    expect(after.mcpServers).toBeUndefined();
+  });
+
+  it("dryRun does not mutate the file", async () => {
+    const original = JSON.stringify({ mcpServers: { "holographic-memory": { command: "npx" } } });
+    writeFileSync(target, original);
+    const result = await migrateLegacyClaudeSettings(true, target);
+    expect(result.changed).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe(original);
+  });
+
+  it("malformed JSON → tolerant skip, file untouched", async () => {
+    writeFileSync(target, "{not valid json");
+    const result = await migrateLegacyClaudeSettings(false, target);
+    expect(result.changed).toBe(false);
+    expect(result.reason).toMatch(/malformed/);
+    expect(readFileSync(target, "utf8")).toBe("{not valid json");
+  });
+
+  it("bad shape (mcpServers as string) → tolerant skip", async () => {
+    writeFileSync(target, JSON.stringify({ mcpServers: "wat" }));
+    const result = await migrateLegacyClaudeSettings(false, target);
+    expect(result.changed).toBe(false);
+    expect(result.reason).toMatch(/bad shape/);
+  });
+
+  it("entry already absent → no-change", async () => {
+    writeFileSync(target, JSON.stringify({ mcpServers: { other: { command: "x" } } }));
+    const result = await migrateLegacyClaudeSettings(false, target);
     expect(result.changed).toBe(false);
   });
 });

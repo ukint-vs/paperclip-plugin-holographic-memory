@@ -62,7 +62,12 @@ const LEGACY_CLAUDE_SETTINGS_PATH = path.join(homedir(), ".claude", "settings.js
 const DEFAULT_CODEX_PATH = path.join(homedir(), ".codex", "config.toml");
 const CLAUDE_CLI = "claude";
 const CODEX_CLI = "codex";
-const CLI_EXEC_TIMEOUT_MS = 10_000;
+// Read-only probes (`--version`, `mcp get`) typically return in <500ms; 5s is
+// generous for slow disks. Mutating ops (`mcp add`, `mcp remove`) can shell
+// out to a keychain, hit the network, or trigger first-run config and
+// routinely take 3-8s on cold systems — give them 30s headroom.
+const CLI_READ_TIMEOUT_MS = 5_000;
+const CLI_WRITE_TIMEOUT_MS = 30_000;
 // `-y` suppresses npx's install prompt. `--package <PACKAGE_NAME>` tells npx
 // which package to install before running the bin — without it, npx assumes
 // the bin name equals the package name and either fails or installs a
@@ -609,12 +614,12 @@ export function _resetExecRunnerForTests(): void {
   _execRunner = defaultExecRunner;
 }
 
+function envFlags(opts: CliOptions): string[] {
+  return Object.entries(buildEnv(opts)).flatMap(([k, v]) => ["--env", `${k}=${v}`]);
+}
+
 // Pure builders — no spawning, easy to unit-test.
 export function buildClaudeMcpAddArgs(opts: CliOptions): string[] {
-  const envFlags: string[] = [];
-  for (const [k, v] of Object.entries(buildEnv(opts))) {
-    envFlags.push("--env", `${k}=${v}`);
-  }
   return [
     "mcp",
     "add",
@@ -622,7 +627,7 @@ export function buildClaudeMcpAddArgs(opts: CliOptions): string[] {
     "user",
     "--transport",
     "stdio",
-    ...envFlags,
+    ...envFlags(opts),
     SERVER_NAME,
     "--",
     opts.command,
@@ -631,11 +636,7 @@ export function buildClaudeMcpAddArgs(opts: CliOptions): string[] {
 }
 
 export function buildCodexMcpAddArgs(opts: CliOptions): string[] {
-  const envFlags: string[] = [];
-  for (const [k, v] of Object.entries(buildEnv(opts))) {
-    envFlags.push("--env", `${k}=${v}`);
-  }
-  return ["mcp", "add", ...envFlags, SERVER_NAME, "--", opts.command, ...opts.args];
+  return ["mcp", "add", ...envFlags(opts), SERVER_NAME, "--", opts.command, ...opts.args];
 }
 
 // Custom --claude-config / --codex-config disables CLI shell-out: the CLIs
@@ -649,7 +650,7 @@ export function shouldUseCodexCli(opts: CliOptions): boolean {
 }
 
 async function detectCli(cli: string): Promise<boolean> {
-  const result = await _execRunner(cli, ["--version"], CLI_EXEC_TIMEOUT_MS);
+  const result = await _execRunner(cli, ["--version"], CLI_READ_TIMEOUT_MS);
   return result.code === 0;
 }
 
@@ -660,7 +661,7 @@ export interface ServerProbe {
 }
 
 async function probeServer(cli: string, serverName: string): Promise<ServerProbe> {
-  const result = await _execRunner(cli, ["mcp", "get", serverName], CLI_EXEC_TIMEOUT_MS);
+  const result = await _execRunner(cli, ["mcp", "get", serverName], CLI_READ_TIMEOUT_MS);
   if (result.code !== 0) {
     return { present: false, scopeMatches: false, rawOutput: result.stdout + result.stderr };
   }
@@ -672,248 +673,182 @@ async function probeServer(cli: string, serverName: string): Promise<ServerProbe
 }
 
 // Compares expected env vars against the raw text output of `mcp get`.
-// Claude prints "    KEY=VALUE" lines; Codex prints "env: KEY=*****"
-// (values masked). When values are masked, fall back to key-presence check —
-// users can force a refresh via --refresh when they need exact-value sync.
-function envInSync(expected: Record<string, string>, raw: string, cli: "claude" | "codex"): boolean {
-  if (cli === "codex") {
+// Claude prints exact "KEY=VALUE" pairs; Codex prints "env: KEY=*****" with
+// values masked, so for Codex we can only verify key presence — users force
+// exact-value sync via --refresh.
+function envInSync(expected: Record<string, string>, raw: string, mode: "exact" | "key-only"): boolean {
+  if (mode === "key-only") {
     return Object.keys(expected).every((k) => raw.includes(k));
   }
   return Object.entries(expected).every(([k, v]) => raw.includes(`${k}=${v}`));
 }
 
-export async function applyClaudeViaCli(opts: CliOptions): Promise<MergeOutcome | null> {
-  if (!shouldUseClaudeCli(opts)) return null;
-  if (!(await detectCli(CLAUDE_CLI))) return null;
+function isNotFoundStderr(res: ExecResult): boolean {
+  return /not found/i.test(res.stderr + res.stdout);
+}
+function stderrOrStdout(res: ExecResult): string {
+  return res.stderr.trim() || res.stdout.trim();
+}
 
-  const probe = await probeServer(CLAUDE_CLI, SERVER_NAME);
-  const expectedEnv = buildEnv(opts);
-  let mustRefresh = false;
-  let driftReason = "";
+interface CliSpec {
+  cli: typeof CLAUDE_CLI | typeof CODEX_CLI;
+  shouldUse(opts: CliOptions): boolean;
+  buildAddArgs(opts: CliOptions): string[];
+  removeArgs: readonly string[];
+  // null = no drift; string = human-readable reason.
+  detectDrift(probe: ServerProbe, expected: Record<string, string>): string | null;
+  // True when the probe shows the entry where it should live (e.g. user scope
+  // for Claude). Drives both install verification and uninstall verification.
+  isWellPlaced(probe: ServerProbe): boolean;
+}
 
-  if (probe.present) {
-    if (!probe.scopeMatches) {
-      driftReason = "scope mismatch (entry exists in non-user scope)";
-      mustRefresh = true;
-    } else if (!envInSync(expectedEnv, probe.rawOutput, "claude")) {
-      driftReason = "env drift detected";
-      mustRefresh = true;
-    }
-  }
+const CLAUDE_SPEC: CliSpec = {
+  cli: CLAUDE_CLI,
+  shouldUse: shouldUseClaudeCli,
+  buildAddArgs: buildClaudeMcpAddArgs,
+  removeArgs: ["mcp", "remove", "--scope", "user", SERVER_NAME],
+  detectDrift(probe, expected) {
+    if (!probe.scopeMatches) return "scope mismatch (entry exists in non-user scope)";
+    if (!envInSync(expected, probe.rawOutput, "exact")) return "env drift detected";
+    return null;
+  },
+  isWellPlaced(probe) {
+    return probe.present && probe.scopeMatches;
+  },
+};
 
-  const willChange = !probe.present || opts.refresh || mustRefresh;
-  const addArgs = buildClaudeMcpAddArgs(opts);
+const CODEX_SPEC: CliSpec = {
+  cli: CODEX_CLI,
+  shouldUse: shouldUseCodexCli,
+  buildAddArgs: buildCodexMcpAddArgs,
+  removeArgs: ["mcp", "remove", SERVER_NAME],
+  detectDrift(probe, expected) {
+    if (!envInSync(expected, probe.rawOutput, "key-only")) return "env keys missing — possible drift";
+    return null;
+  },
+  isWellPlaced(probe) {
+    return probe.present;
+  },
+};
+
+async function applyViaCli(opts: CliOptions, spec: CliSpec): Promise<MergeOutcome | null> {
+  if (!spec.shouldUse(opts)) return null;
+  if (!(await detectCli(spec.cli))) return null;
+
+  const probe = await probeServer(spec.cli, SERVER_NAME);
+  const drift = probe.present ? spec.detectDrift(probe, buildEnv(opts)) : null;
+  const willChange = !probe.present || opts.refresh || drift !== null;
+  const addArgs = spec.buildAddArgs(opts);
+  const refreshSuffix = drift ?? "explicit --refresh";
 
   if (opts.dryRun) {
     if (!willChange) {
       return {
         changed: false,
-        reason: "already registered via claude mcp (user scope, env in sync)",
+        reason: `already registered via ${spec.cli} mcp (env in sync)`,
         output: "",
       };
     }
     const reason = !probe.present
-      ? `would run: ${CLAUDE_CLI} ${addArgs.join(" ")}`
-      : `would refresh via claude mcp (${driftReason || "explicit --refresh"})`;
+      ? `would run: ${spec.cli} ${addArgs.join(" ")}`
+      : `would refresh via ${spec.cli} mcp (${refreshSuffix})`;
     return { changed: true, reason, output: "" };
   }
 
   if (probe.present && !willChange) {
     return {
       changed: false,
-      reason: "already registered via claude mcp (user scope, env in sync)",
+      reason: `already registered via ${spec.cli} mcp (env in sync)`,
       output: "",
     };
   }
 
   if (probe.present && willChange) {
-    const removeRes = await _execRunner(
-      CLAUDE_CLI,
-      ["mcp", "remove", "--scope", "user", SERVER_NAME],
-      CLI_EXEC_TIMEOUT_MS,
-    );
+    const removeRes = await _execRunner(spec.cli, [...spec.removeArgs], CLI_WRITE_TIMEOUT_MS);
     if (removeRes.codeName === "ENOENT") return null;
-    if (removeRes.code !== 0 && !/not found/i.test(removeRes.stderr + removeRes.stdout)) {
-      throw new Error(
-        `claude mcp remove failed: ${removeRes.stderr.trim() || removeRes.stdout.trim()}`,
-      );
+    if (removeRes.code !== 0 && !isNotFoundStderr(removeRes)) {
+      throw new Error(`${spec.cli} mcp remove failed: ${stderrOrStdout(removeRes)}`);
     }
   }
 
-  const addRes = await _execRunner(CLAUDE_CLI, addArgs, CLI_EXEC_TIMEOUT_MS);
+  const addRes = await _execRunner(spec.cli, addArgs, CLI_WRITE_TIMEOUT_MS);
   if (addRes.codeName === "ENOENT") return null;
   if (addRes.code !== 0) {
-    throw new Error(`claude mcp add failed: ${addRes.stderr.trim() || addRes.stdout.trim()}`);
+    throw new Error(`${spec.cli} mcp add failed: ${stderrOrStdout(addRes)}`);
   }
 
   // Post-add verification — catches "exits 0 but didn't write" failures
   // (wrong scope, permissions, races).
-  const verify = await probeServer(CLAUDE_CLI, SERVER_NAME);
-  if (!verify.present || !verify.scopeMatches) {
+  const verify = await probeServer(spec.cli, SERVER_NAME);
+  if (!spec.isWellPlaced(verify)) {
+    const detail = !verify.present ? "still doesn't see the entry" : "shows it in the wrong scope";
     throw new Error(
-      `claude mcp add reported success but \`claude mcp get ${SERVER_NAME}\` ${
-        !verify.present ? "still doesn't see the entry" : "shows it in the wrong scope"
-      }; refusing to claim install succeeded.`,
+      `${spec.cli} mcp add reported success but \`${spec.cli} mcp get ${SERVER_NAME}\` ${detail}; refusing to claim install succeeded.`,
     );
   }
 
   return {
     changed: true,
     reason: probe.present
-      ? `refreshed via claude mcp (${driftReason || "explicit --refresh"})`
-      : "registered via claude mcp add",
+      ? `refreshed via ${spec.cli} mcp (${refreshSuffix})`
+      : `registered via ${spec.cli} mcp add`,
     output: "",
   };
 }
 
-export async function applyCodexViaCli(opts: CliOptions): Promise<MergeOutcome | null> {
-  if (!shouldUseCodexCli(opts)) return null;
-  if (!(await detectCli(CODEX_CLI))) return null;
+async function applyUninstallViaCli(opts: CliOptions, spec: CliSpec): Promise<MergeOutcome | null> {
+  if (!spec.shouldUse(opts)) return null;
+  if (!(await detectCli(spec.cli))) return null;
 
-  const probe = await probeServer(CODEX_CLI, SERVER_NAME);
-  const expectedEnv = buildEnv(opts);
-  let mustRefresh = false;
-  let driftReason = "";
-
-  if (probe.present && !envInSync(expectedEnv, probe.rawOutput, "codex")) {
-    driftReason = "env keys missing — possible drift";
-    mustRefresh = true;
-  }
-
-  const willChange = !probe.present || opts.refresh || mustRefresh;
-  const addArgs = buildCodexMcpAddArgs(opts);
-
-  if (opts.dryRun) {
-    if (!willChange) {
-      return { changed: false, reason: "already registered via codex mcp", output: "" };
-    }
-    const reason = !probe.present
-      ? `would run: ${CODEX_CLI} ${addArgs.join(" ")}`
-      : `would refresh via codex mcp (${driftReason || "explicit --refresh"})`;
-    return { changed: true, reason, output: "" };
-  }
-
-  if (probe.present && !willChange) {
-    return { changed: false, reason: "already registered via codex mcp", output: "" };
-  }
-
-  if (probe.present && willChange) {
-    const removeRes = await _execRunner(
-      CODEX_CLI,
-      ["mcp", "remove", SERVER_NAME],
-      CLI_EXEC_TIMEOUT_MS,
-    );
-    if (removeRes.codeName === "ENOENT") return null;
-    if (removeRes.code !== 0 && !/not found/i.test(removeRes.stderr + removeRes.stdout)) {
-      throw new Error(
-        `codex mcp remove failed: ${removeRes.stderr.trim() || removeRes.stdout.trim()}`,
-      );
-    }
-  }
-
-  const addRes = await _execRunner(CODEX_CLI, addArgs, CLI_EXEC_TIMEOUT_MS);
-  if (addRes.codeName === "ENOENT") return null;
-  if (addRes.code !== 0) {
-    throw new Error(`codex mcp add failed: ${addRes.stderr.trim() || addRes.stdout.trim()}`);
-  }
-
-  const verify = await probeServer(CODEX_CLI, SERVER_NAME);
-  if (!verify.present) {
-    throw new Error(
-      `codex mcp add reported success but \`codex mcp get ${SERVER_NAME}\` still doesn't see the entry; refusing to claim install succeeded.`,
-    );
-  }
-
-  return {
-    changed: true,
-    reason: probe.present
-      ? `refreshed via codex mcp (${driftReason || "explicit --refresh"})`
-      : "registered via codex mcp add",
-    output: "",
-  };
-}
-
-export async function applyClaudeUninstallViaCli(opts: CliOptions): Promise<MergeOutcome | null> {
-  if (!shouldUseClaudeCli(opts)) return null;
-  if (!(await detectCli(CLAUDE_CLI))) return null;
-
-  const probe = await probeServer(CLAUDE_CLI, SERVER_NAME);
+  const probe = await probeServer(spec.cli, SERVER_NAME);
   if (!probe.present) {
-    return { changed: false, reason: "absent (claude mcp)", output: "" };
+    return { changed: false, reason: `absent (${spec.cli} mcp)`, output: "" };
   }
 
   if (opts.dryRun) {
     return {
       changed: true,
-      reason: `would run: claude mcp remove --scope user ${SERVER_NAME}`,
+      reason: `would run: ${spec.cli} ${spec.removeArgs.join(" ")}`,
       output: "",
     };
   }
 
-  const removeRes = await _execRunner(
-    CLAUDE_CLI,
-    ["mcp", "remove", "--scope", "user", SERVER_NAME],
-    CLI_EXEC_TIMEOUT_MS,
-  );
+  const removeRes = await _execRunner(spec.cli, [...spec.removeArgs], CLI_WRITE_TIMEOUT_MS);
   if (removeRes.codeName === "ENOENT") return null;
-  if (removeRes.code !== 0 && !/not found/i.test(removeRes.stderr + removeRes.stdout)) {
-    throw new Error(
-      `claude mcp remove failed: ${removeRes.stderr.trim() || removeRes.stdout.trim()}`,
-    );
+  if (removeRes.code !== 0 && !isNotFoundStderr(removeRes)) {
+    throw new Error(`${spec.cli} mcp remove failed: ${stderrOrStdout(removeRes)}`);
   }
 
-  const verify = await probeServer(CLAUDE_CLI, SERVER_NAME);
-  if (verify.present && verify.scopeMatches) {
-    throw new Error(
-      `claude mcp remove reported success but the entry is still present in user scope.`,
-    );
+  const verify = await probeServer(spec.cli, SERVER_NAME);
+  if (spec.isWellPlaced(verify)) {
+    throw new Error(`${spec.cli} mcp remove reported success but the entry is still present.`);
   }
 
-  return { changed: true, reason: "removed via claude mcp", output: "" };
+  return { changed: true, reason: `removed via ${spec.cli} mcp`, output: "" };
 }
 
-export async function applyCodexUninstallViaCli(opts: CliOptions): Promise<MergeOutcome | null> {
-  if (!shouldUseCodexCli(opts)) return null;
-  if (!(await detectCli(CODEX_CLI))) return null;
-
-  const probe = await probeServer(CODEX_CLI, SERVER_NAME);
-  if (!probe.present) {
-    return { changed: false, reason: "absent (codex mcp)", output: "" };
-  }
-
-  if (opts.dryRun) {
-    return { changed: true, reason: `would run: codex mcp remove ${SERVER_NAME}`, output: "" };
-  }
-
-  const removeRes = await _execRunner(
-    CODEX_CLI,
-    ["mcp", "remove", SERVER_NAME],
-    CLI_EXEC_TIMEOUT_MS,
-  );
-  if (removeRes.codeName === "ENOENT") return null;
-  if (removeRes.code !== 0 && !/not found/i.test(removeRes.stderr + removeRes.stdout)) {
-    throw new Error(
-      `codex mcp remove failed: ${removeRes.stderr.trim() || removeRes.stdout.trim()}`,
-    );
-  }
-
-  const verify = await probeServer(CODEX_CLI, SERVER_NAME);
-  if (verify.present) {
-    throw new Error(`codex mcp remove reported success but the entry is still present.`);
-  }
-
-  return { changed: true, reason: "removed via codex mcp", output: "" };
-}
+export const applyClaudeViaCli = (opts: CliOptions) => applyViaCli(opts, CLAUDE_SPEC);
+export const applyCodexViaCli = (opts: CliOptions) => applyViaCli(opts, CODEX_SPEC);
+export const applyClaudeUninstallViaCli = (opts: CliOptions) => applyUninstallViaCli(opts, CLAUDE_SPEC);
+export const applyCodexUninstallViaCli = (opts: CliOptions) => applyUninstallViaCli(opts, CODEX_SPEC);
 
 // Best-effort cleanup of the legacy ~/.claude/settings.json entry that
 // setup-mcp ≤0.4.1 wrote. Tolerant of malformed JSON / bad shape — never
-// blocks the install path on legacy file corruption.
-export async function migrateLegacyClaudeSettings(dryRun: boolean): Promise<MergeOutcome> {
-  const target = LEGACY_CLAUDE_SETTINGS_PATH;
-  if (!(await pathExists(target))) {
-    return { changed: false, reason: "no legacy settings.json", output: "" };
+// blocks the install path on legacy file corruption. `target` is overridable
+// for tests; production callers always use the default.
+export async function migrateLegacyClaudeSettings(
+  dryRun: boolean,
+  target: string = LEGACY_CLAUDE_SETTINGS_PATH,
+): Promise<MergeOutcome> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(target, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { changed: false, reason: "no legacy settings.json", output: "" };
+    }
+    throw error;
   }
-  const raw = await fs.readFile(target, "utf8");
   if (raw.trim().length === 0) {
     return { changed: false, reason: "legacy settings.json empty", output: "" };
   }
