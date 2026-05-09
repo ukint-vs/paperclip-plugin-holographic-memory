@@ -21,7 +21,7 @@ export const HOLO_MEMORY_ACTIONS = [
 
 export const HoloMemorySearchSchema = z.object({
   action: z.enum(HOLO_MEMORY_ACTIONS).default("search").describe(
-    "search/probe/related/reason/list/feedback/recall_context are read; add/update/remove require retainEnabled=true.",
+    "search/probe/related/reason/list/recall_context are read; add/update/remove/feedback require retainEnabled=true (feedback mutates trust_score on the fact).",
   ),
   query: z.string().optional().describe("Free-text query for search/recall_context fallback."),
   entity: z.string().optional().describe("Entity for probe/related."),
