@@ -687,9 +687,15 @@ describe("applyClaudeViaCli", () => {
     expect(calls.some((c) => c.startsWith("mcp add"))).toBe(true);
   });
 
-  it("CLI present, server present in PROJECT scope → triggers remove + add at user scope", async () => {
+  it("CLI present, server present in PROJECT scope → remove uses --scope project, add uses --scope user", async () => {
+    // Regression test for #36 review: previously the remove was hardcoded to
+    // --scope user, which would silently fail "not found" against the real
+    // project-scope entry, leaving it dangling alongside the new user-scope
+    // add (duplicate entries). Remove must target the actual probed scope.
     let probeCount = 0;
+    const calls: string[] = [];
     const runner: ExecRunner = async (cmd, args) => {
+      calls.push(args.join(" "));
       if (args[0] === "--version") return { code: 0, stdout: "claude 2.0.0", stderr: "" };
       if (args[1] === "get") {
         probeCount++;
@@ -704,6 +710,62 @@ describe("applyClaudeViaCli", () => {
     const result = await applyClaudeViaCli(cliDefaults());
     expect(result!.changed).toBe(true);
     expect(result!.reason).toMatch(/scope mismatch/);
+    expect(calls).toContain(`mcp remove --scope project ${"holographic-memory"}`);
+    const addCall = calls.find((c) => c.startsWith("mcp add"));
+    expect(addCall).toMatch(/--scope user/);
+  });
+
+  it("env drift: probe shows PAPERCLIP_HOLO_MEMORY_DB=/tmp/h.db.bak (substring of expected) → drift detected", async () => {
+    // Regression test for #36 review: substring matching `raw.includes('K=v')`
+    // would falsely report in-sync when the probe shows `K=v.bak` (since "v"
+    // is a prefix of "v.bak"). Word-boundary regex must reject this.
+    let probeCount = 0;
+    const runner: ExecRunner = async (cmd, args) => {
+      if (args[0] === "--version") return { code: 0, stdout: "claude 2.0.0", stderr: "" };
+      if (args[1] === "get") {
+        probeCount++;
+        if (probeCount === 1) {
+          // Probe shows DB path = /tmp/h.db.bak; expected (cliDefaults dbPath)
+          // is /tmp/h.db. Old substring check: `raw.includes("DB=/tmp/h.db")`
+          // would return true (false positive). New regex must return false.
+          const lines = [
+            "Scope: User config",
+            "PAPERCLIP_HOLO_MEMORY_DB=/tmp/h.db.bak",
+            "PAPERCLIP_HOLO_MEMORY_RECALL_ENABLED=true",
+            "PAPERCLIP_HOLO_MEMORY_RETAIN_ENABLED=true",
+            "PAPERCLIP_HOLO_MEMORY_MIN_TRUST=0.3",
+            "PAPERCLIP_HOLO_MEMORY_MAX_RECALL=10",
+          ].join("\n");
+          return { code: 0, stdout: lines, stderr: "" };
+        }
+        return { code: 0, stdout: `Scope: User config\n${expectedEnvLines()}`, stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    _setExecRunnerForTests(runner);
+    const result = await applyClaudeViaCli(cliDefaults());
+    expect(result!.changed).toBe(true);
+    expect(result!.reason).toMatch(/refreshed.*env drift/);
+  });
+
+  it("LOCAL scope mismatch removes with --scope local", async () => {
+    let probeCount = 0;
+    const calls: string[] = [];
+    const runner: ExecRunner = async (cmd, args) => {
+      calls.push(args.join(" "));
+      if (args[0] === "--version") return { code: 0, stdout: "claude 2.0.0", stderr: "" };
+      if (args[1] === "get") {
+        probeCount++;
+        if (probeCount === 1) {
+          return { code: 0, stdout: `Scope: Local config\n${expectedEnvLines()}`, stderr: "" };
+        }
+        return { code: 0, stdout: `Scope: User config\n${expectedEnvLines()}`, stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    _setExecRunnerForTests(runner);
+    await applyClaudeViaCli(cliDefaults());
+    expect(calls.some((c) => c.startsWith("mcp remove --scope local"))).toBe(true);
   });
 
   it("refresh=true with stale entry: remove returns 'not found' → still proceeds with add", async () => {

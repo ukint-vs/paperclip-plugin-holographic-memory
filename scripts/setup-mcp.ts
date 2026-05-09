@@ -673,14 +673,26 @@ async function probeServer(cli: string, serverName: string): Promise<ServerProbe
 }
 
 // Compares expected env vars against the raw text output of `mcp get`.
-// Claude prints exact "KEY=VALUE" pairs; Codex prints "env: KEY=*****" with
-// values masked, so for Codex we can only verify key presence — users force
-// exact-value sync via --refresh.
-function envInSync(expected: Record<string, string>, raw: string, mode: "exact" | "key-only"): boolean {
-  if (mode === "key-only") {
-    return Object.keys(expected).every((k) => raw.includes(k));
+// Claude prints exact "KEY=VALUE" pairs (often whitespace-prefixed); Codex
+// prints "env: KEY=*****, KEY2=*****" with values masked on a single line.
+// Word-boundary anchoring prevents substring false positives like `A=1`
+// matching `OTHER_A=1`; the trailing-boundary check in exact mode prevents
+// `KEY=v` from matching `KEY=v.bak`.
+function envInSync(
+  expected: Record<string, string>,
+  raw: string,
+  mode: "exact" | "key-only",
+): boolean {
+  for (const [k, v] of Object.entries(expected)) {
+    if (mode === "key-only") {
+      const keyRe = new RegExp(`\\b${escapeRegExp(k)}=`);
+      if (!keyRe.test(raw)) return false;
+    } else {
+      const exactRe = new RegExp(`\\b${escapeRegExp(k)}=${escapeRegExp(v)}(?:[\\s,]|$)`);
+      if (!exactRe.test(raw)) return false;
+    }
   }
-  return Object.entries(expected).every(([k, v]) => raw.includes(`${k}=${v}`));
+  return true;
 }
 
 function isNotFoundStderr(res: ExecResult): boolean {
@@ -694,7 +706,13 @@ interface CliSpec {
   cli: typeof CLAUDE_CLI | typeof CODEX_CLI;
   shouldUse(opts: CliOptions): boolean;
   buildAddArgs(opts: CliOptions): string[];
-  removeArgs: readonly string[];
+  // Build remove args from the live probe. Claude reads the actual scope
+  // from `Scope: X config` so a project-scope-mismatched entry gets cleaned
+  // out of its real location instead of failing "not found" against a
+  // hardcoded user scope (which would leave the entry dangling and create
+  // a duplicate when the new user-scope add lands). Codex has no scopes,
+  // so the probe argument is unused there.
+  buildRemoveArgs(probe: ServerProbe): string[];
   // null = no drift; string = human-readable reason.
   detectDrift(probe: ServerProbe, expected: Record<string, string>): string | null;
   // True when the probe shows the entry where it should live (e.g. user scope
@@ -702,11 +720,24 @@ interface CliSpec {
   isWellPlaced(probe: ServerProbe): boolean;
 }
 
+// Parses the scope name from `claude mcp get` output. Returns "user" as the
+// safe default when the entry is absent (the install path uses --scope user
+// to add) or the format is unrecognized.
+function probedClaudeScope(probe: ServerProbe): "user" | "project" | "local" {
+  if (!probe.present) return "user";
+  const m = /Scope:\s*(User|Project|Local)\s*config/i.exec(probe.rawOutput);
+  const captured = m?.[1]?.toLowerCase();
+  if (captured === "user" || captured === "project" || captured === "local") return captured;
+  return "user";
+}
+
 const CLAUDE_SPEC: CliSpec = {
   cli: CLAUDE_CLI,
   shouldUse: shouldUseClaudeCli,
   buildAddArgs: buildClaudeMcpAddArgs,
-  removeArgs: ["mcp", "remove", "--scope", "user", SERVER_NAME],
+  buildRemoveArgs(probe) {
+    return ["mcp", "remove", "--scope", probedClaudeScope(probe), SERVER_NAME];
+  },
   detectDrift(probe, expected) {
     if (!probe.scopeMatches) return "scope mismatch (entry exists in non-user scope)";
     if (!envInSync(expected, probe.rawOutput, "exact")) return "env drift detected";
@@ -721,7 +752,9 @@ const CODEX_SPEC: CliSpec = {
   cli: CODEX_CLI,
   shouldUse: shouldUseCodexCli,
   buildAddArgs: buildCodexMcpAddArgs,
-  removeArgs: ["mcp", "remove", SERVER_NAME],
+  buildRemoveArgs() {
+    return ["mcp", "remove", SERVER_NAME];
+  },
   detectDrift(probe, expected) {
     if (!envInSync(expected, probe.rawOutput, "key-only")) return "env keys missing — possible drift";
     return null;
@@ -764,7 +797,11 @@ async function applyViaCli(opts: CliOptions, spec: CliSpec): Promise<MergeOutcom
   }
 
   if (probe.present && willChange) {
-    const removeRes = await _execRunner(spec.cli, [...spec.removeArgs], CLI_WRITE_TIMEOUT_MS);
+    const removeRes = await _execRunner(
+      spec.cli,
+      spec.buildRemoveArgs(probe),
+      CLI_WRITE_TIMEOUT_MS,
+    );
     if (removeRes.codeName === "ENOENT") return null;
     if (removeRes.code !== 0 && !isNotFoundStderr(removeRes)) {
       throw new Error(`${spec.cli} mcp remove failed: ${stderrOrStdout(removeRes)}`);
@@ -805,15 +842,17 @@ async function applyUninstallViaCli(opts: CliOptions, spec: CliSpec): Promise<Me
     return { changed: false, reason: `absent (${spec.cli} mcp)`, output: "" };
   }
 
+  const removeArgs = spec.buildRemoveArgs(probe);
+
   if (opts.dryRun) {
     return {
       changed: true,
-      reason: `would run: ${spec.cli} ${spec.removeArgs.join(" ")}`,
+      reason: `would run: ${spec.cli} ${removeArgs.join(" ")}`,
       output: "",
     };
   }
 
-  const removeRes = await _execRunner(spec.cli, [...spec.removeArgs], CLI_WRITE_TIMEOUT_MS);
+  const removeRes = await _execRunner(spec.cli, removeArgs, CLI_WRITE_TIMEOUT_MS);
   if (removeRes.codeName === "ENOENT") return null;
   if (removeRes.code !== 0 && !isNotFoundStderr(removeRes)) {
     throw new Error(`${spec.cli} mcp remove failed: ${stderrOrStdout(removeRes)}`);
