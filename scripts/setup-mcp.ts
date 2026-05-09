@@ -2,9 +2,9 @@
 import fs from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import TOML from "@iarna/toml";
 import { atomicWrite } from "../src/atomic-write.js";
+import { isInvokedAsScript } from "../src/invoked-as-script.js";
 
 // Idempotent merger that registers (or removes) the holographic-memory MCP
 // server in the user's Claude Code (~/.claude/settings.json -> mcpServers)
@@ -636,18 +636,11 @@ Options:
   if (code !== 0) process.exit(code);
 }
 
-const invokedAsScript = (() => {
-  // fileURLToPath gives a real platform path (handles Windows drive prefixes
-  // and URL-encoded spaces); a raw URL.pathname compare would mismatch on those.
-  try {
-    const filename = fileURLToPath(import.meta.url);
-    return process.argv[1] === filename || /setup-mcp\.(ts|js)$/.test(process.argv[1] ?? "");
-  } catch {
-    return /setup-mcp\.(ts|js)$/.test(process.argv[1] ?? "");
-  }
-})();
-
-if (invokedAsScript) {
+// Helper resolves symlinks so npm-bin invocations
+// (/usr/local/bin/paperclip-holographic-memory-setup → dist/setup-mcp.js)
+// are detected correctly. 0.4.0 shipped a regex-on-argv1 guard that missed
+// every npm-bin user.
+if (isInvokedAsScript(import.meta.url, process.argv[1])) {
   main().catch((error) => {
     process.stderr.write(`setup-mcp failed: ${(error as Error).message}\n`);
     process.exit(2);

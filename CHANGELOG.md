@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-09
+Hotfix: 0.4.0 shipped both bins (`paperclip-holographic-memory-setup` and `paperclip-holographic-memory-mcp`) with a broken `invokedAsScript` guard. The guard regex'd `process.argv[1]` against `/setup-mcp\.(ts|js)$/`, but npm-bin invocations expose `argv[1]` as the symlink path (`/usr/local/bin/paperclip-holographic-memory-setup`), which has no relation to the source file basename. Result: every `npx -y --package ...` and `npm i -g + bin` user hit a silent no-op when running the setup bin. The mcp-server bin had a similar guard but tested the resolved filename, so it ran correctly in production despite the suboptimal pattern.
+
+### Fixed
+- `setup-mcp` bin now actually runs `main()` when invoked via npm bin (was a silent no-op in 0.4.0). Replaced the regex-on-argv1 guard with a `realpathSync(argv1) === realpathSync(filename)` check that resolves symlinks correctly. Both bins now use the same helper at `src/invoked-as-script.ts`.
+
+### Changed
+- Extracted the script-invocation guard to `src/invoked-as-script.ts` so it's unit-testable. New `tests/invoked-as-script.spec.ts` covers the npm-bin symlink case as a regression test against the 0.4.0 bug.
+
 ## [0.4.0] - 2026-05-09
 First release published to npm. Versions 0.1 – 0.3 below were internal pre-release milestones, never published.
 

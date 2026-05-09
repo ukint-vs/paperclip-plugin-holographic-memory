@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { DEFAULT_DB_PATH, expandHome } from "./config.js";
 import { closeStores, dispatchStandaloneAction, type ToolParams } from "./dispatch.js";
+import { isInvokedAsScript } from "./invoked-as-script.js";
 import { readPackageVersion } from "./package-version.js";
 import {
   HOLO_MEMORY_TOOL_DESCRIPTION,
@@ -154,23 +154,9 @@ async function main(): Promise<void> {
 
 // Run main() only when invoked as the entry script, not when imported in
 // tests. The shebang above makes this directly executable via `npx ...`.
-const invokedAsScript = (() => {
-  if (typeof process === "undefined") return false;
-  const argv1 = process.argv[1];
-  if (!argv1) return false;
-  // tsx and node both populate argv[1] with the resolved path of the script;
-  // in production this is dist/mcp-server.js. fileURLToPath gives a real
-  // platform path (handles Windows drive prefixes and URL-encoded spaces);
-  // a raw URL.pathname compare would mismatch on those.
-  try {
-    const filename = fileURLToPath(import.meta.url);
-    return filename === argv1 || /mcp-server\.(js|ts)$/.test(filename);
-  } catch {
-    return /mcp-server\.(js|ts)$/.test(argv1);
-  }
-})();
-
-if (invokedAsScript) {
+// Helper resolves symlinks so npm-bin invocations work correctly; see
+// src/invoked-as-script.ts for the 0.4.0 regression this guards against.
+if (isInvokedAsScript(import.meta.url, process.argv[1])) {
   main().catch((error) => {
     process.stderr.write(`[holographic-memory] MCP server failed to start: ${(error as Error).message}\n`);
     closeStores();
