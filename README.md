@@ -10,7 +10,9 @@ npx -y --package paperclip-plugin-holographic-memory paperclip-holographic-memor
 
 Restart Claude Code (or Codex). The tool surfaces as `mcp__holographic-memory__holographic_memory_search`.
 
-The setup writes `npx -y --package paperclip-plugin-holographic-memory paperclip-holographic-memory-mcp` as the MCP command, so you don't need a global install. The long invocation is the cost of unscoped-package + descriptive-bin naming: without `--package`, npx looks for a package matching the bin name and fails.
+Setup registers via `claude mcp add --scope user` and `codex mcp add` (the canonical entry points in current Claude Code and Codex), falling back to direct file writes (`~/.claude.json` / `~/.codex/config.toml`) when those CLIs aren't on PATH. The MCP command is `npx -y --package paperclip-plugin-holographic-memory paperclip-holographic-memory-mcp`, so you don't need a global install — `--package` is required because the bin name and package name differ; without it, npx looks for a package matching the bin and fails.
+
+> **Migrating from 0.4.x:** older versions wrote to `~/.claude/settings.json`, which Claude Code 2.x silently ignores (issue #34). Run setup once to register at the right location; it also automatically removes the stale entry from `~/.claude/settings.json`.
 
 ### Optional: global install (skip per-spawn npx)
 
@@ -188,9 +190,9 @@ For end users (after `npm install` or via npx directly):
 ```bash
 SETUP="npx -y --package paperclip-plugin-holographic-memory paperclip-holographic-memory-setup"
 
-$SETUP                          # merges entries into ~/.claude + ~/.codex
+$SETUP                          # registers via claude/codex mcp add (or files as fallback)
 $SETUP --dry-run                # preview without writing
-$SETUP --print                  # emit snippets to stdout for manual paste
+$SETUP --print                  # emit equivalent CLI command lines to stdout
 $SETUP --refresh                # rewrite entries (e.g. after dbPath change)
 $SETUP --scope claude           # claude only; also: --scope codex
 $SETUP --uninstall              # remove entries from both configs
@@ -200,12 +202,14 @@ For repo contributors working from a checkout, `pnpm setup:mcp` runs the same sc
 
 The script:
 
-- Creates `~/.claude/settings.json` or `~/.codex/config.toml` if missing (mode `0600`).
-- Backs up to `.bak` before any write.
-- Aborts with exit code 2 if either file is malformed (never overwrites broken state); same exit code on semantic-shape errors (e.g. `mcpServers` is a string instead of an object).
-- Is idempotent: re-running with the same flags is a no-op. Same for `--uninstall` — running it on already-clean configs exits 0 with `already absent`.
-- Preserves comments in `~/.codex/config.toml` by appending a marker block,
-  not by round-tripping through a TOML parser.
+- Prefers `claude mcp add --scope user` and `codex mcp add` (the supported entry points in current Claude Code and Codex). Verifies the entry actually persisted with a follow-up `claude mcp get` / `codex mcp get` so a CLI that exits 0 without writing isn't silently accepted.
+- Falls back to direct file writes when the CLIs aren't on PATH (CI, containers, fresh installs). Targets `~/.claude.json` and `~/.codex/config.toml`, creating them with mode `0600` if missing and backing up to `.bak` before any write.
+- Automatically cleans up any stale `mcpServers.holographic-memory` entry left in `~/.claude/settings.json` by setup-mcp ≤0.4.1.
+- Aborts with exit code 2 if a target file is malformed (never overwrites broken state); same exit code on semantic-shape errors (e.g. `mcpServers` is a string instead of an object).
+- Is idempotent: re-running with the same flags is a no-op. Same for `--uninstall`.
+- Detects drift: if the entry exists with stale env vars (e.g. you changed `--db-path`), refreshes it automatically without `--refresh`.
+- Preserves comments in `~/.codex/config.toml` (file-write path) by appending a marker block, not by round-tripping through a TOML parser. Refuses to overlay an unmarked `[mcp_servers.holographic-memory]` table that another tool installed; suggests running `codex mcp remove` first.
+- Passing `--claude-config <path>` or `--codex-config <path>` forces the file-write path (the CLIs don't accept arbitrary config locations).
 - Supports `--command` as alias for `--command-path`, and `--args=VALUE` (equals form) alongside `--args VALUE` (space form).
 - Refuses to combine `--uninstall` with `--refresh` (install-only semantics).
 
