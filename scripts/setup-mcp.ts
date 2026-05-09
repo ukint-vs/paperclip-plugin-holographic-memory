@@ -570,8 +570,9 @@ async function run(opts: CliOptions): Promise<number> {
     }
     allClean = false;
     if (opts.dryRun) {
-      const verb = opts.uninstall ? "would" : "would";
-      process.stdout.write(`[${label}] ${target}: ${verb} ${outcome.reason}\n`);
+      // outcome.reason already names the action ("add"/"remove"/"refresh"),
+      // so the prefix is just "would" regardless of install vs uninstall.
+      process.stdout.write(`[${label}] ${target}: would ${outcome.reason}\n`);
       process.stdout.write(`---- ${target} (preview) ----\n${outcome.output}---- end preview ----\n`);
       continue;
     }
