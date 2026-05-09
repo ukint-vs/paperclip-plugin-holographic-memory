@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -9,6 +11,26 @@ import {
   HoloMemorySearchSchema,
 } from "./tool-schema.js";
 import type { HolographicMemoryConfig } from "./types.js";
+
+// Read version from package.json at module init so the MCP server's
+// self-reported `version` (advertised on every initialize handshake) tracks
+// package.json without manual sync. Pre-0.4.0 this was hardcoded to "0.1.0"
+// and stayed there across releases. Resolves both in src/ (../package.json)
+// and dist/ (sibling to dist/, also ../package.json).
+function readPackageVersion(): string {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const pkgPath = join(here, "..", "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string };
+    return pkg.version ?? "0.0.0";
+  } catch {
+    // Sandboxed contexts where package.json isn't readable — never expected
+    // in the published-bin path, but keeps the server bootable rather than
+    // throwing during initialize().
+    return "0.0.0";
+  }
+}
+export const PACKAGE_VERSION = readPackageVersion();
 
 // Standalone MCP stdio server bridging holographic_memory_search to claude_local
 // and codex_local agents. Spawned per claude/codex session via the user's
@@ -63,7 +85,7 @@ export function resolveStandaloneConfig(env: NodeJS.ProcessEnv = process.env): H
 export function createServer(config: HolographicMemoryConfig = resolveStandaloneConfig()): McpServer {
   const server = new McpServer({
     name: "holographic-memory",
-    version: "0.1.0",
+    version: PACKAGE_VERSION,
   });
 
   server.registerTool(

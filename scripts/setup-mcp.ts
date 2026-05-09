@@ -1,4 +1,4 @@
-#!/usr/bin/env tsx
+#!/usr/bin/env node
 import fs from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -6,31 +6,51 @@ import { fileURLToPath } from "node:url";
 import TOML from "@iarna/toml";
 import { atomicWrite } from "../src/atomic-write.js";
 
-// Idempotent merger that registers the holographic-memory MCP server in the
-// user's Claude Code (~/.claude/settings.json -> mcpServers) and Codex
-// (~/.codex/config.toml -> [mcp_servers.holographic-memory]) configs.
+// Idempotent merger that registers (or removes) the holographic-memory MCP
+// server in the user's Claude Code (~/.claude/settings.json -> mcpServers)
+// and Codex (~/.codex/config.toml -> [mcp_servers.holographic-memory]) configs.
 //
-// Behavior matrix (from /plan-eng-review B2):
-//   missing file  -> create with mode 0600
-//   valid file    -> backup .bak, atomic merge (tmp + rename)
-//   malformed     -> abort exit 2 with a diagnostic, never touch the file
-//   symlink       -> resolved write
-//   --print       -> stdout only, no writes
-//   --dry-run     -> diff-style preview, no writes
-//   --refresh     -> rewrite the entry even if marker present (idempotent
-//                    re-create after dbPath change)
+// Behavior matrix:
+//   missing file       -> create with mode 0600 (install) / no-op (uninstall)
+//   valid file         -> backup .bak, atomic merge (tmp + rename)
+//   malformed (parse)  -> abort exit 2 with diagnostic, never touch the file
+//   malformed (shape)  -> abort exit 2 (e.g. mcpServers is a string/array/null)
+//   symlink            -> resolved write
+//   --print            -> stdout only, no writes (install OR uninstall snippets)
+//   --dry-run          -> diff-style preview, no writes
+//   --refresh          -> rewrite the entry even if marker present (install-only)
+//   --uninstall        -> remove the entry from both configs (mirror of install)
+//
+// Concurrent runs: unsupported. The .bak rotation + atomic-rename pair is
+// not transactional across processes; running install + uninstall (or two
+// installs) at once against the same target file races. Single-user dev is
+// the only supported usage today.
+//
+// Partial-success: if --scope=both writes Claude OK then Codex fails (or vice
+// versa), the run aborts at exit 2 with the second target untouched. Rerun
+// is safe — both install and uninstall are idempotent so the recovery path
+// is "fix whatever broke and rerun the same command."
 
 const SERVER_NAME = "holographic-memory";
+const PACKAGE_NAME = "paperclip-plugin-holographic-memory";
+const BIN_NAME = "paperclip-holographic-memory-mcp";
 const TOML_MARKER_BEGIN = `# managed by paperclip-plugin-${SERVER_NAME}`;
 const TOML_MARKER_END = `# end paperclip-plugin-${SERVER_NAME}`;
 const DEFAULT_DB_PATH = "~/.paperclip/instances/default/hermes-memory.db";
 const DEFAULT_COMMAND = "npx";
-const DEFAULT_ARGS = ["paperclip-holographic-memory-mcp"];
+// `-y` suppresses npx's install prompt. `--package <PACKAGE_NAME>` tells npx
+// which package to install before running the bin — without it, npx assumes
+// the bin name equals the package name and either fails or installs a
+// squatter package matching the bin name. Bin name and package name diverge
+// here (paperclip-plugin-holographic-memory vs paperclip-holographic-memory-mcp)
+// so --package is load-bearing.
+const DEFAULT_ARGS = ["-y", "--package", PACKAGE_NAME, BIN_NAME];
 
 export interface CliOptions {
   print: boolean;
   dryRun: boolean;
   refresh: boolean;
+  uninstall: boolean;
   scope: "claude" | "codex" | "both";
   dbPath: string;
   recallEnabled: boolean;
@@ -43,12 +63,42 @@ export interface CliOptions {
   codexPath: string;
 }
 
+// Aliases for canonical flag names. `--command` accepted as alias for
+// `--command-path` because earlier docs/blog posts referenced the shorter
+// spelling; silent ignore on the canonical name would corrupt setup
+// invocations users copy-pasted from older sources.
+const FLAG_ALIASES: Record<string, readonly string[]> = {
+  "command-path": ["command"],
+};
+
+// parseFlag accepts both space (`--name VALUE`) and equals (`--name=VALUE`)
+// forms. Equals form is what GNU long-option convention sets users' fingers
+// to type; space form was the original implementation. Both must work or
+// silent misconfig.
 function parseFlag<T>(argv: string[], name: string, parse: (raw: string) => T): T | undefined {
-  const idx = argv.indexOf(`--${name}`);
+  const dashed = `--${name}`;
+  // Equals form first: --name=VALUE
+  for (const arg of argv) {
+    if (arg.startsWith(`${dashed}=`)) {
+      return parse(arg.slice(dashed.length + 1));
+    }
+  }
+  // Space form: --name VALUE
+  const idx = argv.indexOf(dashed);
   if (idx === -1) return undefined;
   const value = argv[idx + 1];
   if (value === undefined || value.startsWith("--")) return undefined;
   return parse(value);
+}
+
+function parseFlagWithAliases<T>(argv: string[], canonical: string, parse: (raw: string) => T): T | undefined {
+  const direct = parseFlag(argv, canonical, parse);
+  if (direct !== undefined) return direct;
+  for (const alias of FLAG_ALIASES[canonical] ?? []) {
+    const aliased = parseFlag(argv, alias, parse);
+    if (aliased !== undefined) return aliased;
+  }
+  return undefined;
 }
 
 // Accept the same boolean spellings the env-var parser in mcp-server.ts does
@@ -59,20 +109,38 @@ function parseBoolFlag(raw: string): boolean {
   return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
-function parseArgs(argv: string[]): CliOptions {
-  const has = (name: string) => argv.includes(`--${name}`);
+// hasFlag also recognizes `--name=anything` form.
+function hasFlag(argv: string[], name: string): boolean {
+  if (argv.includes(`--${name}`)) return true;
+  return argv.some((arg) => arg.startsWith(`--${name}=`));
+}
+
+export function parseArgs(argv: string[]): CliOptions {
+  const has = (name: string) => hasFlag(argv, name);
   const scopeRaw = parseFlag(argv, "scope", (s) => s) ?? "both";
   if (!["claude", "codex", "both"].includes(scopeRaw)) {
     throw new Error(`--scope must be one of claude|codex|both, got "${scopeRaw}"`);
   }
+  const uninstall = has("uninstall");
+  const refresh = has("refresh");
+  if (uninstall && refresh) {
+    // --refresh is install-only semantics ("rewrite the entry even if already
+    // present"). Pairing it with --uninstall has no defined meaning.
+    throw new Error("--uninstall and --refresh cannot be combined; --refresh is install-only.");
+  }
   const dbPath =
     parseFlag(argv, "db-path", (s) => s) ?? process.env.PAPERCLIP_HOLO_MEMORY_DB ?? DEFAULT_DB_PATH;
-  const command = parseFlag(argv, "command-path", (s) => s) ?? DEFAULT_COMMAND;
-  const argsFlag = parseFlag(argv, "args", (s) => s.split(",").map((part) => part.trim()).filter(Boolean));
+  const command = parseFlagWithAliases(argv, "command-path", (s) => s) ?? DEFAULT_COMMAND;
+  // Empty `--args=` yields an empty array, useful when overriding to a
+  // direct global-install bin invocation that takes no npx-prefix args.
+  const argsFlag = parseFlag(argv, "args", (s) =>
+    s.length === 0 ? [] : s.split(",").map((part) => part.trim()).filter(Boolean),
+  );
   return {
     print: has("print"),
     dryRun: has("dry-run"),
-    refresh: has("refresh"),
+    refresh,
+    uninstall,
     scope: scopeRaw as "claude" | "codex" | "both",
     dbPath,
     recallEnabled: parseFlag(argv, "recall", parseBoolFlag) ?? true,
@@ -157,6 +225,32 @@ export interface ClaudeSettingsLike {
   [key: string]: unknown;
 }
 
+// Validate the top-level shape of settings.json before mutation. Without
+// this, `mcpServers` set to a string/array/null would spread blindly and
+// corrupt the user's config silently. Throws with a diagnostic on
+// semantic malformation; the caller catches and exits 2.
+// Exported for unit testing (called from applyClaude + applyClaudeUninstall).
+export function validateClaudeSettings(parsed: unknown, target: string): ClaudeSettingsLike {
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    const what =
+      parsed === null ? "null" : Array.isArray(parsed) ? "an array" : `a ${typeof parsed}`;
+    throw new Error(
+      `Refusing to touch ${target}: top-level value is ${what}, expected an object. Fix the file or pass --print and copy manually.`,
+    );
+  }
+  const obj = parsed as Record<string, unknown>;
+  if ("mcpServers" in obj) {
+    const ms = obj.mcpServers;
+    if (ms === null || typeof ms !== "object" || Array.isArray(ms)) {
+      const what = ms === null ? "null" : Array.isArray(ms) ? "an array" : `a ${typeof ms}`;
+      throw new Error(
+        `Refusing to touch ${target}: mcpServers is ${what}, expected an object. Fix the file or pass --print and copy manually.`,
+      );
+    }
+  }
+  return obj as ClaudeSettingsLike;
+}
+
 export function mergeClaudeSettings(
   existing: ClaudeSettingsLike | null,
   entry: Record<string, unknown>,
@@ -182,21 +276,72 @@ export function mergeClaudeSettings(
   };
 }
 
+export function mergeClaudeUninstall(existing: ClaudeSettingsLike | null): MergeOutcome {
+  if (existing === null) {
+    return { changed: false, reason: "no settings file present", output: "" };
+  }
+  if (!existing.mcpServers || !(SERVER_NAME in existing.mcpServers)) {
+    return {
+      changed: false,
+      reason: `mcpServers.${SERVER_NAME} already absent`,
+      output: JSON.stringify(existing, null, 2) + "\n",
+    };
+  }
+  const servers: Record<string, unknown> = { ...existing.mcpServers };
+  delete servers[SERVER_NAME];
+  // Drop the mcpServers key entirely if removing our entry empties it,
+  // rather than leaving a dangling `"mcpServers": {}` that wasn't there
+  // before this plugin was installed.
+  const merged: ClaudeSettingsLike = { ...existing };
+  if (Object.keys(servers).length === 0) {
+    delete merged.mcpServers;
+  } else {
+    merged.mcpServers = servers;
+  }
+  return {
+    changed: true,
+    reason: `remove mcpServers.${SERVER_NAME}`,
+    output: JSON.stringify(merged, null, 2) + "\n",
+  };
+}
+
 async function applyClaude(opts: CliOptions): Promise<MergeOutcome> {
   const entry = buildClaudeEntry(opts);
   let existing: ClaudeSettingsLike | null = null;
   if (await pathExists(opts.claudePath)) {
     const raw = await fs.readFile(opts.claudePath, "utf8");
     if (raw.trim().length > 0) {
+      let parsed: unknown;
       try {
-        existing = JSON.parse(raw) as ClaudeSettingsLike;
+        parsed = JSON.parse(raw);
       } catch (error) {
         const message = (error as Error).message;
         throw new Error(`Refusing to overwrite ${opts.claudePath}: invalid JSON (${message}). Fix the file or pass --print and copy manually.`);
       }
+      existing = validateClaudeSettings(parsed, opts.claudePath);
     }
   }
   return mergeClaudeSettings(existing, entry, opts.refresh);
+}
+
+async function applyClaudeUninstall(opts: CliOptions): Promise<MergeOutcome> {
+  if (!(await pathExists(opts.claudePath))) {
+    return { changed: false, reason: "no settings file present", output: "" };
+  }
+  const raw = await fs.readFile(opts.claudePath, "utf8");
+  if (raw.trim().length === 0) {
+    return { changed: false, reason: "settings file empty", output: "" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(
+      `Refusing to overwrite ${opts.claudePath}: invalid JSON (${(error as Error).message}). Fix the file or pass --print and copy manually.`,
+    );
+  }
+  const validated = validateClaudeSettings(parsed, opts.claudePath);
+  return mergeClaudeUninstall(validated);
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +406,43 @@ export function mergeCodexConfig(existing: string, block: string, refresh: boole
   return { changed: true, reason: "append [mcp_servers.holographic-memory] block", output };
 }
 
+export function mergeCodexUninstall(existing: string): MergeOutcome {
+  const startMatch = TOML_MARKER_BEGIN_RE.exec(existing);
+  const endMatch = TOML_MARKER_END_RE.exec(existing);
+  if (!startMatch && !endMatch) {
+    return { changed: false, reason: "marker block already absent", output: existing };
+  }
+  // Partial-marker corruption: BEGIN-without-END, END-without-BEGIN, or
+  // END-before-BEGIN. Don't try to repair — refuse to touch the file with
+  // a clear diagnostic so the user can hand-fix or use --print to regenerate.
+  if (!startMatch || !endMatch || endMatch.index < startMatch.index) {
+    const which = !startMatch
+      ? "END marker without BEGIN"
+      : !endMatch
+        ? "BEGIN marker without END"
+        : "END marker before BEGIN";
+    return {
+      changed: false,
+      reason: `marker block corrupt (${which}); leaving file untouched. Hand-fix the markers or use --print to regenerate.`,
+      output: existing,
+    };
+  }
+  // Strip from BEGIN line through END line, including the END's trailing
+  // newline if present so we don't leave an orphan blank line.
+  const startIdx = startMatch.index;
+  const endIdx = endMatch.index + endMatch[0].length;
+  const trailingNewline = existing[endIdx] === "\n" ? 1 : 0;
+  const before = existing.slice(0, startIdx);
+  const after = existing.slice(endIdx + trailingNewline);
+  // Collapse the separator that the install path inserted: a leading "\n\n"
+  // before the block becomes a single "\n" after removal.
+  const beforeTrimmed = before.replace(/\n\s*$/, "");
+  const beforeOut = beforeTrimmed.length === 0 ? "" : beforeTrimmed + "\n";
+  const afterOut = after.replace(/^\s*\n/, "");
+  const output = beforeOut + afterOut;
+  return { changed: true, reason: `remove [mcp_servers.${SERVER_NAME}] block`, output };
+}
+
 async function applyCodex(opts: CliOptions): Promise<MergeOutcome> {
   const block = buildCodexBlock(opts);
   let existing = "";
@@ -296,6 +478,38 @@ async function applyCodex(opts: CliOptions): Promise<MergeOutcome> {
   return outcome;
 }
 
+async function applyCodexUninstall(opts: CliOptions): Promise<MergeOutcome> {
+  if (!(await pathExists(opts.codexPath))) {
+    return { changed: false, reason: "no codex config present", output: "" };
+  }
+  const existing = await fs.readFile(opts.codexPath, "utf8");
+  if (existing.trim().length === 0) {
+    return { changed: false, reason: "codex config empty", output: "" };
+  }
+  // Same parse guard as install: don't touch malformed TOML.
+  try {
+    TOML.parse(existing);
+  } catch (error) {
+    throw new Error(
+      `Refusing to overwrite ${opts.codexPath}: existing TOML is malformed (${(error as Error).message}). Fix the file or pass --print and copy manually.`,
+    );
+  }
+  const outcome = mergeCodexUninstall(existing);
+  // Validate the post-removal TOML still parses (it should — we only
+  // strip lines, never add). Guards against accidental bracket damage
+  // from the slice math.
+  if (outcome.changed && outcome.output.trim().length > 0) {
+    try {
+      TOML.parse(outcome.output);
+    } catch (error) {
+      throw new Error(
+        `Refusing to write ${opts.codexPath}: post-uninstall TOML would not parse (${(error as Error).message}). This is a bug in setup-mcp.ts; pass --print and copy manually.`,
+      );
+    }
+  }
+  return outcome;
+}
+
 // ---------------------------------------------------------------------------
 // Output helpers
 // ---------------------------------------------------------------------------
@@ -307,18 +521,38 @@ function printSnippets(opts: CliOptions): void {
   process.stdout.write(`# Add to ${opts.codexPath} (append):\n${buildCodexBlock(opts)}\n`);
 }
 
+function printUninstallSnippets(opts: CliOptions): void {
+  process.stdout.write(`# Remove from ${opts.claudePath} (delete this key under mcpServers):\n  "${SERVER_NAME}"\n\n`);
+  process.stdout.write(
+    `# Remove from ${opts.codexPath} (delete from BEGIN through END marker, inclusive):\n${TOML_MARKER_BEGIN}\n[mcp_servers.${SERVER_NAME}]\n... (config lines) ...\n${TOML_MARKER_END}\n`,
+  );
+}
+
 async function run(opts: CliOptions): Promise<number> {
   if (opts.print) {
-    printSnippets(opts);
+    if (opts.uninstall) {
+      printUninstallSnippets(opts);
+    } else {
+      printSnippets(opts);
+    }
     return 0;
   }
 
-  const tasks: Array<["claude" | "codex", string, () => Promise<MergeOutcome>]> = [];
+  type Apply = () => Promise<MergeOutcome>;
+  const tasks: Array<["claude" | "codex", string, Apply]> = [];
   if (opts.scope === "claude" || opts.scope === "both") {
-    tasks.push(["claude", opts.claudePath, () => applyClaude(opts)]);
+    tasks.push([
+      "claude",
+      opts.claudePath,
+      opts.uninstall ? () => applyClaudeUninstall(opts) : () => applyClaude(opts),
+    ]);
   }
   if (opts.scope === "codex" || opts.scope === "both") {
-    tasks.push(["codex", opts.codexPath, () => applyCodex(opts)]);
+    tasks.push([
+      "codex",
+      opts.codexPath,
+      opts.uninstall ? () => applyCodexUninstall(opts) : () => applyCodex(opts),
+    ]);
   }
 
   let allClean = true;
@@ -336,7 +570,8 @@ async function run(opts: CliOptions): Promise<number> {
     }
     allClean = false;
     if (opts.dryRun) {
-      process.stdout.write(`[${label}] ${target}: would ${outcome.reason}\n`);
+      const verb = opts.uninstall ? "would" : "would";
+      process.stdout.write(`[${label}] ${target}: ${verb} ${outcome.reason}\n`);
       process.stdout.write(`---- ${target} (preview) ----\n${outcome.output}---- end preview ----\n`);
       continue;
     }
@@ -362,18 +597,23 @@ async function main(): Promise<void> {
   if (argv.includes("--help") || argv.includes("-h")) {
     process.stdout.write(`Usage: setup-mcp [options]
 
-Registers the holographic-memory MCP server in:
+Registers (or removes) the holographic-memory MCP server in:
   ~/.claude/settings.json   (Claude Code mcpServers)
   ~/.codex/config.toml      ([mcp_servers.holographic-memory])
 
 Options:
   --print               Print snippets to stdout, no writes
+                        (with --uninstall: print "remove" instructions)
   --dry-run             Show what would change, no writes
-  --refresh             Rewrite entries even if already present
+  --refresh             Rewrite entries even if already present (install-only)
+  --uninstall           Remove the entry from both configs (mirror of install)
   --scope <s>           claude | codex | both (default: both)
   --db-path <path>      DB path (default: ${DEFAULT_DB_PATH})
   --command-path <bin>  MCP command (default: ${DEFAULT_COMMAND})
-  --args a,b,c          Comma-separated args (default: ${DEFAULT_ARGS.join(",")})
+                        Alias: --command
+  --args a,b,c          Comma-separated args (also accepts --args=a,b,c)
+                        Default: ${DEFAULT_ARGS.join(",")}
+                        Empty (--args=) for direct global-bin invocation.
   --recall true|false   recallEnabled in MCP mode (default: true)
   --retain true|false   retainEnabled in MCP mode (default: true)
   --min-trust <num>     minTrustScore (default: 0.3)
