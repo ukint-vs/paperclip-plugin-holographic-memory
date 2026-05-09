@@ -23,6 +23,9 @@ Persistent, cross-run memory for agents via `holographic_memory_search`. An isol
 > ```
 > mcp__holographic-memory__holographic_memory_search
 > action: "recall_context"
+> run_id: "<current run ID>"
+> issue_id: "<current issue ID>"
+> agent_id: "<your agent ID>"
 > ```
 > If your adapter uses a different tool name, find the `holographic_memory_search` tool and call it with `action: "recall_context"`.
 > **Failure to call this means you have no memory between runs.** You will repeat mistakes, forget conventions, and ask the user questions you should already know the answer to.
