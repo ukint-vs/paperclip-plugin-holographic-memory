@@ -90,7 +90,7 @@ The tool is `holographic_memory_search` (or `mcp__holographic-memory__holographi
 
 All actions accept `min_trust` (0–1) to filter weak facts. Default is 0.3.
 
-Writes (`add`/`update`/`remove`) require `retainEnabled=true` in config (defaults to `true` in standalone MCP mode, `false` in the Paperclip plugin).
+Writes (`add`/`update`/`remove`/`feedback`) require `retainEnabled=true` in config (defaults to `true` in standalone MCP mode, `false` in the Paperclip plugin). `feedback` mutates trust_score on the fact, so it counts as a write — under the Paperclip default, Step 4 (rate what you used) is rejected until retain is enabled.
 
 ## Examples
 
