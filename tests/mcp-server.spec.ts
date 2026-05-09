@@ -1,6 +1,9 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { closeStores } from "../src/dispatch.js";
-import { createServer, resolveStandaloneConfig } from "../src/mcp-server.js";
+import { PACKAGE_VERSION, createServer, resolveStandaloneConfig } from "../src/mcp-server.js";
 import { tempDb } from "./helpers.js";
 
 afterEach(() => {
@@ -67,5 +70,21 @@ describe("createServer", () => {
     // round-trip lives in tests/mcp-smoke.spec.ts (spawn-based), which
     // exercises tools/list + tools/call against this same factory.
     expect(server).toBeDefined();
+  });
+});
+
+describe("PACKAGE_VERSION", () => {
+  // Regression guard: pre-0.4.0 the MCP server hardcoded `version: "0.1.0"`
+  // and stayed there across releases. Reading from package.json at runtime
+  // means the advertised version always matches the published artifact.
+  it("matches the package.json version exactly (no hardcoded drift)", () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const pkgPath = join(here, "..", "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version: string };
+    expect(PACKAGE_VERSION).toBe(pkg.version);
+  });
+
+  it("is a non-empty semver-shaped string (sanity)", () => {
+    expect(PACKAGE_VERSION).toMatch(/^\d+\.\d+\.\d+/);
   });
 });

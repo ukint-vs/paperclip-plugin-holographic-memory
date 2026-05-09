@@ -1,6 +1,36 @@
 # paperclip-plugin-holographic-memory
 
-Paperclip recall plugin backed by an isolated holographic SQLite memory store.
+Paperclip recall plugin backed by an isolated holographic SQLite memory store. Also ships a standalone MCP server so Claude Code and Codex see the same memory directly — no Paperclip required.
+
+## Quickstart for Claude Code / Codex users
+
+```bash
+npx -y --package paperclip-plugin-holographic-memory paperclip-holographic-memory-setup
+```
+
+Restart Claude Code (or Codex). The tool surfaces as `mcp__holographic-memory__holographic_memory_search`.
+
+The setup writes `npx -y --package paperclip-plugin-holographic-memory paperclip-holographic-memory-mcp` as the MCP command, so you don't need a global install. The long invocation is the cost of unscoped-package + descriptive-bin naming: without `--package`, npx looks for a package matching the bin name and fails.
+
+### Optional: global install (skip per-spawn npx)
+
+```bash
+npm i -g paperclip-plugin-holographic-memory
+paperclip-holographic-memory-setup --command-path paperclip-holographic-memory-mcp --args=
+```
+
+Now the MCP-config command points at the global bin directly; spawns are faster (no `npx` resolution per session).
+
+### Removing the plugin
+
+```bash
+npx -y --package paperclip-plugin-holographic-memory paperclip-holographic-memory-setup --uninstall
+npm uninstall -g paperclip-plugin-holographic-memory  # if installed globally
+```
+
+Order matters: run `--uninstall` first, then `npm uninstall`. Reverse order leaves dangling MCP entries pointing at a missing bin; Claude Code shows MCP errors on every restart until the user manually edits their config.
+
+## Background
 
 The plugin owns a Paperclip-specific SQLite database at
 `~/.paperclip/instances/default/hermes-memory.db`. It uses the same facts,
@@ -27,12 +57,12 @@ state for the run, and expose an agent tool for targeted recall.
 - Agent write loop: `add`, `update`, `remove` actions gated by `retainEnabled`,
   all wrapped in SQLite transactions.
 - Fact feedback that adjusts trust scores.
-- Two ways to populate the DB: one-time Postgres seed, or Claude-Code-driven
+- Auto-extraction on `agent.run.finished` (regex-based, Hermes-parity, since 0.2.0):
+  produces at most one `user_pref` and one `project` fact per scanned text.
+- Two ways to bulk-populate the DB: one-time Postgres seed, or Claude-Code-driven
   curation via `pnpm import:facts`.
-- No event-driven auto-extraction; facts only enter the store via seed, import,
-  or the agent calling `add`.
 
-## Installation
+## Installation (Paperclip plugin path)
 
 This is an independent plugin published on npm as
 [`paperclip-plugin-holographic-memory`](https://www.npmjs.com/package/paperclip-plugin-holographic-memory).
@@ -121,8 +151,8 @@ Subprocess-based adapters (`claude_local` spawning `claude --print`,
 `codex_local` spawning `codex`) do not — the SDK's tool RPC is invisible to
 those external CLIs. To bridge them, this package ships a standalone MCP
 stdio server (`paperclip-holographic-memory-mcp`) that wraps the same SQLite
-store, plus a setup script that registers it in your Claude Code and Codex
-MCP configs. See `issue #20` for the architectural rationale.
+store, plus a setup script (`paperclip-holographic-memory-setup`) that registers
+it in your Claude Code and Codex MCP configs.
 
 ```text
                          READ + RECALL_CONTEXT (cached)
@@ -153,22 +183,31 @@ MCP configs. See `issue #20` for the architectural rationale.
 
 ### One-time setup
 
+For end users (after `npm install` or via npx directly):
+
 ```bash
-pnpm setup:mcp                  # merges entries into ~/.claude + ~/.codex
-pnpm setup:mcp --dry-run        # preview without writing
-pnpm setup:mcp --print          # emit snippets to stdout for manual paste
-pnpm setup:mcp --refresh        # rewrite entries (e.g. after dbPath change)
-pnpm setup:mcp --scope claude   # claude only; also: --scope codex
+SETUP="npx -y --package paperclip-plugin-holographic-memory paperclip-holographic-memory-setup"
+
+$SETUP                          # merges entries into ~/.claude + ~/.codex
+$SETUP --dry-run                # preview without writing
+$SETUP --print                  # emit snippets to stdout for manual paste
+$SETUP --refresh                # rewrite entries (e.g. after dbPath change)
+$SETUP --scope claude           # claude only; also: --scope codex
+$SETUP --uninstall              # remove entries from both configs
 ```
+
+For repo contributors working from a checkout, `pnpm setup:mcp` runs the same script via `tsx` and accepts identical flags.
 
 The script:
 
 - Creates `~/.claude/settings.json` or `~/.codex/config.toml` if missing (mode `0600`).
 - Backs up to `.bak` before any write.
-- Aborts with exit code 2 if either file is malformed (never overwrites broken state).
-- Is idempotent: re-running with the same flags is a no-op.
+- Aborts with exit code 2 if either file is malformed (never overwrites broken state); same exit code on semantic-shape errors (e.g. `mcpServers` is a string instead of an object).
+- Is idempotent: re-running with the same flags is a no-op. Same for `--uninstall` — running it on already-clean configs exits 0 with `already absent`.
 - Preserves comments in `~/.codex/config.toml` by appending a marker block,
   not by round-tripping through a TOML parser.
+- Supports `--command` as alias for `--command-path`, and `--args=VALUE` (equals form) alongside `--args VALUE` (space form).
+- Refuses to combine `--uninstall` with `--refresh` (install-only semantics).
 
 After setup, restart Claude Code (or Codex) and the
 `mcp__holographic-memory__holographic_memory_search` tool will be available.
@@ -200,10 +239,27 @@ Without an explicit ID, `recall_context` returns
 ### Limitations
 
 - **dbPath drift**: if you change `dbPath` in Paperclip Settings, re-run
-  `pnpm setup:mcp --refresh` so the MCP server's env stays in sync.
+  `npx -y --package paperclip-plugin-holographic-memory paperclip-holographic-memory-setup --refresh`
+  so the MCP server's env stays in sync.
 - **Concurrent writers**: SQLite WAL serializes writers; `busy_timeout=5000`
   is set so contended writes wait up to 5s for the lock. Single-user dev
   profiles never hit this; CI farms running many concurrent agents might.
+- **Concurrent setup runs are not transactional**: running install and uninstall
+  at the same time against the same config file races (the `.bak` rotation +
+  atomic-rename pair is not cross-process locked). Single-user usage is the
+  only supported pattern.
+
+## Known limitations
+
+- **`better-sqlite3` native install**: this package depends on `better-sqlite3`,
+  which compiles a native binding at install time. Prebuilds exist for common
+  platforms (macOS arm64/x64, Linux arm64/x64 on Node 20+); Windows may require
+  `windows-build-tools` or equivalent. If `npm install` fails with a
+  node-gyp / Python error, install build tools and retry.
+- **`npx` cold-start cost**: every Claude Code / Codex MCP spawn re-runs
+  `npx -y --package ...` which checks the npm registry for updates. Adds ~1-3s
+  to the warm-cache cold start of the MCP server. Skip via the
+  "Optional: global install" path above if that bothers you.
 
 ## Agent tool
 

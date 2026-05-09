@@ -1,10 +1,11 @@
 import type { PaperclipPluginManifestV1, PluginToolDeclaration } from "@paperclipai/plugin-sdk";
+import { readPackageVersion } from "./package-version.js";
 import { toJsonSchema } from "./tool-schema.js";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: "paperclip-plugin-holographic-memory",
   apiVersion: 1,
-  version: "0.1.0",
+  version: readPackageVersion(),
   displayName: "Holographic Memory",
   author: "Vadim Smirnov <ukint-vs@proton.me>",
   description:

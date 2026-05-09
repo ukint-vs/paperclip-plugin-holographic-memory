@@ -4,11 +4,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { DEFAULT_DB_PATH, expandHome } from "./config.js";
 import { closeStores, dispatchStandaloneAction, type ToolParams } from "./dispatch.js";
+import { readPackageVersion } from "./package-version.js";
 import {
   HOLO_MEMORY_TOOL_DESCRIPTION,
   HoloMemorySearchSchema,
 } from "./tool-schema.js";
 import type { HolographicMemoryConfig } from "./types.js";
+
+export const PACKAGE_VERSION = readPackageVersion();
 
 // Standalone MCP stdio server bridging holographic_memory_search to claude_local
 // and codex_local agents. Spawned per claude/codex session via the user's
@@ -63,7 +66,7 @@ export function resolveStandaloneConfig(env: NodeJS.ProcessEnv = process.env): H
 export function createServer(config: HolographicMemoryConfig = resolveStandaloneConfig()): McpServer {
   const server = new McpServer({
     name: "holographic-memory",
-    version: "0.1.0",
+    version: PACKAGE_VERSION,
   });
 
   server.registerTool(
