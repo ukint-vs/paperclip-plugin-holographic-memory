@@ -8,3 +8,4 @@ coverage/
 # Personal sanity-check script tied to an unrelated project; intentionally
 # untracked so it doesn't leak into npm or the public repo.
 scripts/sanity-aperol.ts
+manifest.json
