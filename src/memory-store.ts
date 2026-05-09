@@ -141,16 +141,10 @@ export class MemoryStore {
         return { factId: existing.fact_id, inserted: false };
       }
 
-      // Single-tenant invariant: the dedup SELECT above returns the
-      // existing factId before this INSERT runs whenever the same
-      // tenant re-submits the same content, so the table-level UNIQUE
-      // on `content` cannot fire today. A cross-tenant collision (two
-      // companies inserting identical text on a shared dbPath) would
-      // surface here as a SQLite UNIQUE error and propagate to the
-      // caller — fine for the multi-tenant misuse it represents.
-      // Closed issues #9 / #28 cover the proper fix (recreate facts
-      // with `(company_id, content) UNIQUE`) once a second company
-      // is actually onboarded.
+      // The dedup SELECT above guarantees content novelty per
+      // (content, companyId), so the table-level UNIQUE on `content`
+      // only fires on a cross-tenant collision over a shared dbPath
+      // — the SQLite error propagates to the caller as-is.
       const result = this.db
         .prepare(
           "INSERT INTO facts (content, category, tags, trust_score, source, agent_id, run_id, company_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"

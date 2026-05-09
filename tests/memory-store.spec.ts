@@ -491,15 +491,8 @@ describe("MemoryStore", () => {
       expect(all).toHaveLength(3);
     });
 
-    it("documents the single-tenant invariant: cross-tenant content collision now throws", () => {
-      // PR #27 surfaced cross-tenant collisions as
-      // `{ inserted: false, reason: "content_collision" }`. With #9
-      // closed deferred-pending-multi-tenant, that catch branch is
-      // gone — same-content cross-tenant INSERTs propagate the
-      // SQLite UNIQUE error to the caller. The single-tenant
-      // invariant (content novelty checked by the dedup SELECT
-      // before INSERT) means this only fires under multi-tenant
-      // misuse on a shared dbPath.
+    it("throws on cross-tenant content collision", () => {
+      // Shared-dbPath multi-tenant misuse only — see addFact comment.
       const store = freshStore();
       const a = store.addFact({ content: "Same fact text", category: "project", trustScore: 0.8, companyId: "co-A" });
       expect(a.inserted).toBe(true);
