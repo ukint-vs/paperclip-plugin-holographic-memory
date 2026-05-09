@@ -18,6 +18,20 @@ Persistent, cross-run memory for agents via `holographic_memory_search`. An isol
 
 ## When to use
 
+> **CRITICAL — DO THIS FIRST.**
+> Before loading the `paperclip` skill, before reading HEARTBEAT.md, before any tool calls whatsoever:
+> ```
+> mcp__holographic-memory__holographic_memory_search
+> action: "recall_context"
+> run_id: "<current run ID>"
+> issue_id: "<current issue ID>"
+> agent_id: "<your agent ID>"
+> ```
+> If your adapter uses a different tool name, find the `holographic_memory_search` tool and call it with `action: "recall_context"`.
+> **Failure to call this means you have no memory between runs.** You will repeat mistakes, forget conventions, and ask the user questions you should already know the answer to.
+>
+> After you get the MEMORY CONTEXT back, then proceed with your normal Paperclip heartbeat.
+
 **Mandatory — at the START of every run, before any work:**
 - Call `recall_context` with your run_id, issue_id, and agent_id to get a briefing of relevant facts.
 
@@ -90,7 +104,7 @@ The tool is `holographic_memory_search` (or `mcp__holographic-memory__holographi
 
 All actions accept `min_trust` (0–1) to filter weak facts. Default is 0.3.
 
-Writes (`add`/`update`/`remove`/`feedback`) require `retainEnabled=true` in config (defaults to `true` in standalone MCP mode, `false` in the Paperclip plugin). `feedback` mutates trust_score on the fact, so it counts as a write — under the Paperclip default, Step 4 (rate what you used) is rejected until retain is enabled.
+Writes (`add`/`update`/`remove`) require `retainEnabled=true` in config (defaults to `true` in standalone MCP mode, `false` in the Paperclip plugin).
 
 ## Examples
 
