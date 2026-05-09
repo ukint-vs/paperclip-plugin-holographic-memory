@@ -55,7 +55,7 @@ Read the returned MEMORY CONTEXT. It surfaces facts relevant to the current issu
 
 ### 2. Search before acting
 
-Before touching a project, probing the entity. Before changing a convention, searching for existing patterns. Before fixing a bug, searching for past pitfalls.
+Before touching a project, probe the relevant entities. Before changing a convention, search for existing patterns. Before fixing a bug, search for past pitfalls.
 
 ### 3. Store what matters
 
@@ -90,15 +90,15 @@ The tool is `holographic_memory_search` (or `mcp__holographic-memory__holographi
 
 All actions accept `min_trust` (0–1) to filter weak facts. Default is 0.3.
 
-Writes (`add`/`update`/`remove`) require `retainEnabled=true` in plugin config — off by default to prevent pollution.
+Writes (`add`/`update`/`remove`) require `retainEnabled=true` in config (defaults to `true` in standalone MCP mode, `false` in the Paperclip plugin).
 
 ## Examples
 
 **Starting a run on a Vara Sails issue:**
-1. `recall_context` → "Vara Sails Engineer is a Hermes/DeepSeek agent, wallet v0.16.0, block time 3s..."
-2. Probe the entity: `probe, entity: "Vara"` → gets wallet conventions, gas details
+1. `action: "recall_context"` → "Vara Sails Engineer is a Hermes/DeepSeek agent, wallet v0.16.0, block time 3s..."
+2. `action: "probe", entity: "Vara"` → gets wallet conventions, gas details
 3. Now you know the toolchain without asking the user
 
 **After discovering a fix:**
-1. `add, content: "Sails build --skip-idl avoids IDL hanging on Vara WASM >64KB", category: "tool", tags: "sails,build,pitfall"`
+1. `action: "add", content: "Sails build --skip-idl avoids IDL hanging on Vara WASM >64KB", category: "tool", tags: "sails,build,pitfall"`
 2. Next agent hitting the same issue searches, finds it, skips the dead end
