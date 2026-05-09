@@ -141,24 +141,21 @@ export class MemoryStore {
         return { factId: existing.fact_id, inserted: false };
       }
 
-      let result;
-      try {
-        result = this.db
-          .prepare(
-            "INSERT INTO facts (content, category, tags, trust_score, source, agent_id, run_id, company_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-          )
-          .run(content, category, tags, trustScore, source, agentId, runId, companyId);
-      } catch (error) {
-        // Residual sharp edge: facts.content is still UNIQUE at the
-        // table level, so even with per-company dedup another company
-        // owning the same text blocks the INSERT. Surface the collision
-        // explicitly instead of leaking the other company's fact_id.
-        // Resolved by #9 (table recreation: content UNIQUE → (company_id, content) UNIQUE).
-        if (isUniqueConstraintError(error)) {
-          return { factId: 0, inserted: false, reason: "content_collision" };
-        }
-        throw error;
-      }
+      // Single-tenant invariant: the dedup SELECT above returns the
+      // existing factId before this INSERT runs whenever the same
+      // tenant re-submits the same content, so the table-level UNIQUE
+      // on `content` cannot fire today. A cross-tenant collision (two
+      // companies inserting identical text on a shared dbPath) would
+      // surface here as a SQLite UNIQUE error and propagate to the
+      // caller — fine for the multi-tenant misuse it represents.
+      // Closed issues #9 / #28 cover the proper fix (recreate facts
+      // with `(company_id, content) UNIQUE`) once a second company
+      // is actually onboarded.
+      const result = this.db
+        .prepare(
+          "INSERT INTO facts (content, category, tags, trust_score, source, agent_id, run_id, company_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .run(content, category, tags, trustScore, source, agentId, runId, companyId);
       const factId = Number(result.lastInsertRowid);
       const entities = extractEntities(content);
 

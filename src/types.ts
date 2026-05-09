@@ -59,10 +59,6 @@ export interface AgentRunEvent {
 export interface AddFactResult {
   factId: number;
   inserted: boolean;
-  // Set when a write was rejected because another company already owns
-  // that exact content (residual sharp edge of the table-level UNIQUE
-  // on facts.content). Defer the table recreation to #9.
-  reason?: "content_collision";
 }
 
 export interface UpdateFactPartial {

@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Removed
+- `AddFactResult.reason` and the `content_collision` catch branch in
+  `addFact`. These were a safety valve for cross-tenant content
+  collisions that can only fire under multi-tenant misuse on a shared
+  `dbPath`. Single-tenant runs are guaranteed-safe by the dedup SELECT
+  before INSERT. Closed issues #9 (schema migration framework) and #28
+  (MCP cross-tenant scoping) as deferred-pending-multi-tenant; reopen
+  alongside the second company onboarding.
+
 ### Added
 - Cross-tenant scoping (#3). New `company_id TEXT` column on `facts` via the same idempotent `ALTER TABLE` shim used for provenance in 0.2.0. Every read SELECT in the store filters by `(company_id = ? OR company_id IS NULL)` when a `companyId` is supplied; NULL = global so existing curated/seed rows keep working without a backfill. `addFact` writes `company_id`, scopes dedup per-company, and catches the residual `UNIQUE`-on-content collision (returning `inserted: false, reason: "content_collision"`) instead of leaking another company's `fact_id`. Worker pass-through wired end-to-end: `event.companyId` reaches recall + auto-extract; `runCtx.companyId` reaches every dispatch handler (search/probe/related/reason/list/recall_context/add) via the `CoreActionHandler` signature.
 - Recall observability (#7). `handleRunStarted` now emits structured logs on every exit path: `recall: fired` (with `facts`, `avgScore`, `maxScore`, `avgTrust`, `scopesWritten`, `scopesFailed`, `elapsedMs`, plus run/issue/agent/company IDs), `recall: skipped` with a `reason` enum (`disabled` / `missing_issue_id` / `empty_issue` / `no_facts`), plus error/warn lines for issue-fetch / search / partial-and-all scope-write failures. From server logs alone you can now answer "did recall contribute, and if not, why" without inspecting plugin state.
