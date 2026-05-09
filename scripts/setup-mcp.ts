@@ -281,11 +281,10 @@ export function mergeClaudeUninstall(existing: ClaudeSettingsLike | null): Merge
     return { changed: false, reason: "no settings file present", output: "" };
   }
   if (!existing.mcpServers || !(SERVER_NAME in existing.mcpServers)) {
-    return {
-      changed: false,
-      reason: `mcpServers.${SERVER_NAME} already absent`,
-      output: JSON.stringify(existing, null, 2) + "\n",
-    };
+    // Output is unused on no-change paths in run() — match the empty-output
+    // shape of the "no settings file" branch above (and mergeCodexUninstall's
+    // already-absent branch) instead of re-stringifying for nothing.
+    return { changed: false, reason: `mcpServers.${SERVER_NAME} already absent`, output: "" };
   }
   const servers: Record<string, unknown> = { ...existing.mcpServers };
   delete servers[SERVER_NAME];
