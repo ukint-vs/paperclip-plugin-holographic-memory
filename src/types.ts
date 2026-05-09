@@ -4,6 +4,13 @@ export interface HolographicMemoryConfig {
   retainEnabled: boolean;
   minTrustScore: number;
   maxFactsPerRecall: number;
+  // Half-life for trust decay, in days. 0 (default) disables decay so existing
+  // ranking is preserved on upgrade. When > 0, a fact's effective trust at
+  // scoring time is `trustScore * 0.5^(ageDays / trustHalfLifeDays)`, where
+  // ageDays is computed from the fact's last_accessed_at (falling back to
+  // created_at via SQL COALESCE). Decay applies only on the scored read paths
+  // (search, related); list/probe/reason keep raw trust ordering.
+  trustHalfLifeDays: number;
 }
 
 export interface MemoryFact {
@@ -31,6 +38,11 @@ export interface MemorySearchOptions {
   // Scope reads to this company plus NULL (global) rows. Omit only
   // for trusted server-side audits.
   companyId?: string;
+  // Trust half-life in days for the scored ranking paths (search, related).
+  // 0 / omitted means no decay (default). Per-call rather than constructor-
+  // injected so a Settings UI toggle propagates without store-registry
+  // invalidation, matching the pattern used by minTrust / limit / companyId.
+  halfLifeDays?: number;
 }
 
 export interface NewMemoryFact {

@@ -27,6 +27,7 @@ export function baseConfig(
     retainEnabled: true,
     minTrustScore: 0.3,
     maxFactsPerRecall: 10,
+    trustHalfLifeDays: 0,
     ...overrides,
   };
 }

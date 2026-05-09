@@ -24,4 +24,17 @@ describe("config", () => {
     expect(expandHome("~/memory.db")).toMatch(/memory\.db$/);
     expect(expandHome("/tmp/memory.db")).toBe("/tmp/memory.db");
   });
+
+  it("defaults trustHalfLifeDays to 0 (decay disabled)", () => {
+    expect(resolvePluginConfig().trustHalfLifeDays).toBe(0);
+    expect(resolvePluginConfig({}).trustHalfLifeDays).toBe(0);
+  });
+
+  it("clamps negative trustHalfLifeDays to 0", () => {
+    expect(resolvePluginConfig({ trustHalfLifeDays: -5 }).trustHalfLifeDays).toBe(0);
+  });
+
+  it("clamps absurd trustHalfLifeDays to 3650 (~10 years)", () => {
+    expect(resolvePluginConfig({ trustHalfLifeDays: 99999 }).trustHalfLifeDays).toBe(3650);
+  });
 });

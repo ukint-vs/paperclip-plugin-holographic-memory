@@ -50,15 +50,18 @@ export type CoreActionHandler = (
 // Build the read-side options shared by every search-style handler.
 // Cross-tenant scoping piggybacks on this: every read path scopes to the
 // caller's company (plus NULL = global rows), so two companies sharing a
-// dbPath cannot see each other's facts.
+// dbPath cannot see each other's facts. halfLifeDays is widened in once
+// here so every scored read (search, related) inherits decay automatically;
+// list/probe/reason ignore it inside the store (no scoreFact call there).
 function readOptions(
   params: ToolParams,
   config: HolographicMemoryConfig,
   runCtx?: ToolRunContext
-): { limit: number; minTrust: number; companyId?: string } {
-  const opts: { limit: number; minTrust: number; companyId?: string } = {
+): { limit: number; minTrust: number; halfLifeDays: number; companyId?: string } {
+  const opts: { limit: number; minTrust: number; halfLifeDays: number; companyId?: string } = {
     limit: params.limit ?? 5,
-    minTrust: params.min_trust ?? config.minTrustScore
+    minTrust: params.min_trust ?? config.minTrustScore,
+    halfLifeDays: config.trustHalfLifeDays
   };
   if (runCtx?.companyId) opts.companyId = runCtx.companyId;
   return opts;
@@ -158,7 +161,13 @@ export async function handleList(
   runCtx?: ToolRunContext
 ): Promise<DispatchToolResult> {
   const base = readOptions(params, config, runCtx);
-  const options: { limit: number; minTrust: number; category?: string; companyId?: string } = { ...base };
+  const options: {
+    limit: number;
+    minTrust: number;
+    halfLifeDays: number;
+    category?: string;
+    companyId?: string;
+  } = { ...base };
   if (params.category) options.category = params.category;
   const facts = store.listFacts(options);
   return { content: JSON.stringify({ facts, count: facts.length }), data: { facts, count: facts.length } };

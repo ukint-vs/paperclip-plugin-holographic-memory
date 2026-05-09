@@ -26,6 +26,11 @@ interface FactRow {
   agent_id?: string | null;
   run_id?: string | null;
   company_id?: string | null;
+  // Epoch seconds projected via SQL `unixepoch(COALESCE(last_accessed_at,
+  // created_at))`. We compute age in JS, but parsing SQLite's
+  // "YYYY-MM-DD HH:MM:SS" with Date.parse treats it as local time, which
+  // silently corrupts ranking outside UTC; integer epoch sidesteps that.
+  last_touched_unix?: number | null;
   score?: number;
   fts_rank_raw?: number | null;
 }
@@ -35,6 +40,7 @@ interface FactRow {
 interface ScorableFact extends MemoryFact {
   hrrVector?: Float64Array;
   ftsRankRaw?: number;
+  lastTouchedUnix?: number;
 }
 
 interface MemoryStoreOptions {
@@ -68,6 +74,7 @@ export class MemoryStore {
     const limit = normalizeLimit(options.limit);
     const minTrust = options.minTrust ?? 0;
     const companyId = options.companyId;
+    const halfLifeDays = options.halfLifeDays ?? 0;
     const ftsQuery = toFtsQuery(query);
 
     if (!ftsQuery) {
@@ -96,9 +103,10 @@ export class MemoryStore {
 
     const queryTokens = tokenize(query);
     const queryVector = this.hrrEnabled ? encodeText(query, this.hrrDim) : undefined;
+    const nowSec = Date.now() / 1000;
 
     const scored = candidates
-      .map((fact) => scoreFact(fact, queryTokens, queryVector, ftsLookup))
+      .map((fact) => scoreFact(fact, queryTokens, queryVector, ftsLookup, halfLifeDays, nowSec))
       .sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || b.trustScore - a.trustScore || a.factId - b.factId)
       .slice(0, limit);
 
@@ -309,6 +317,7 @@ export class MemoryStore {
     const limit = normalizeLimit(options.limit);
     const minTrust = options.minTrust ?? 0;
     const companyId = options.companyId;
+    const halfLifeDays = options.halfLifeDays ?? 0;
     const entityVector = encodeAtom(entity.toLowerCase(), this.hrrDim);
     const roleContent = encodeAtom("__hrr_role_content__", this.hrrDim);
     const companyClause = companyId ? "AND (company_id = ? OR company_id IS NULL)" : "";
@@ -316,18 +325,25 @@ export class MemoryStore {
     if (companyId) params.push(companyId);
     const rows = this.db
       .prepare(
-        `SELECT fact_id, content, category, tags, trust_score, retrieval_count, helpful_count, hrr_vector, source, agent_id, run_id, company_id
+        `SELECT fact_id, content, category, tags, trust_score, retrieval_count, helpful_count, hrr_vector,
+                source, agent_id, run_id, company_id,
+                COALESCE(unixepoch(last_accessed_at), unixepoch(created_at)) AS last_touched_unix
          FROM facts
          WHERE hrr_vector IS NOT NULL
            AND COALESCE(trust_score, 0) >= ?
            ${companyClause}`
       )
       .all(...params) as FactRow[];
+    const nowSec = Date.now() / 1000;
     const results = rows
       .map((row) => {
         const vector = bytesToPhases(row.hrr_vector ?? Buffer.alloc(0));
         const residual = unbind(vector, entityVector);
-        const score = ((similarity(residual, roleContent) + 1) / 2) * (row.trust_score ?? 0);
+        const trust = row.trust_score ?? 0;
+        const ageDays = ageDaysFromUnix(row.last_touched_unix, nowSec);
+        const score =
+          ((similarity(residual, roleContent) + 1) / 2) *
+          decayedTrust(trust, ageDays, halfLifeDays);
         return { ...mapFactRow(row), score };
       })
       .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
@@ -372,15 +388,32 @@ export class MemoryStore {
     const oldTrust = row.trust_score;
     const newTrust = normalizeTrust(oldTrust + (helpful ? 0.05 : -0.1));
     const helpfulIncrement = helpful ? 1 : 0;
-    this.db
-      .prepare(
-        `UPDATE facts
-         SET trust_score = ?,
-             helpful_count = helpful_count + ?,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE fact_id = ?`
-      )
-      .run(newTrust, helpfulIncrement, factId);
+    // Positive feedback also resets the decay clock — the user told us this
+    // fact is still good. Negative feedback does NOT bump last_accessed_at:
+    // a freshly-penalised fact should still age cleanly so the penalty
+    // doesn't get diluted by a "last touched" reset.
+    if (helpful) {
+      this.db
+        .prepare(
+          `UPDATE facts
+           SET trust_score = ?,
+               helpful_count = helpful_count + ?,
+               updated_at = CURRENT_TIMESTAMP,
+               last_accessed_at = CURRENT_TIMESTAMP
+           WHERE fact_id = ?`
+        )
+        .run(newTrust, helpfulIncrement, factId);
+    } else {
+      this.db
+        .prepare(
+          `UPDATE facts
+           SET trust_score = ?,
+               helpful_count = helpful_count + ?,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE fact_id = ?`
+        )
+        .run(newTrust, helpfulIncrement, factId);
+    }
 
     return {
       factId,
@@ -413,6 +446,11 @@ export class MemoryStore {
     // legacy curated/seed rows keep working without a backfill. New writes
     // always pass companyId from the event/runCtx envelope.
     addColumnIfMissing("company_id", "TEXT");
+    // Last-touched timestamp for trust decay (#8). Bumped on read via
+    // incrementRetrievalCounts and on positive feedback. Migrated rows leave
+    // this NULL; scoring falls back to created_at via SQL COALESCE so they
+    // age from the only timestamp the system has for them.
+    addColumnIfMissing("last_accessed_at", "TIMESTAMP");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_facts_company ON facts(company_id);");
   }
 
@@ -424,7 +462,9 @@ export class MemoryStore {
     const rows = this.db
       .prepare(
         `SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score, f.retrieval_count,
-                f.helpful_count, f.hrr_vector, f.source, f.agent_id, f.run_id, f.company_id, facts_fts.rank AS fts_rank_raw
+                f.helpful_count, f.hrr_vector, f.source, f.agent_id, f.run_id, f.company_id,
+                COALESCE(unixepoch(f.last_accessed_at), unixepoch(f.created_at)) AS last_touched_unix,
+                facts_fts.rank AS fts_rank_raw
          FROM facts_fts
          JOIN facts f ON facts_fts.rowid = f.fact_id
          WHERE facts_fts MATCH ?
@@ -447,9 +487,13 @@ export class MemoryStore {
 
     const results = new Map<number, ScorableFact>();
     const companyClause = companyId ? "AND (f.company_id = ? OR f.company_id IS NULL)" : "";
+    // last_touched_unix is projected so search()'s scoring path can apply
+    // decay; probe() uses the same SELECT but does not call scoreFact, so
+    // probe ranking is unaffected by the projection.
     const stmt = this.db.prepare(
       `SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score, f.retrieval_count,
-              f.helpful_count, f.hrr_vector, f.source, f.agent_id, f.run_id, f.company_id
+              f.helpful_count, f.hrr_vector, f.source, f.agent_id, f.run_id, f.company_id,
+              COALESCE(unixepoch(f.last_accessed_at), unixepoch(f.created_at)) AS last_touched_unix
        FROM facts f
        JOIN fact_entities fe ON f.fact_id = fe.fact_id
        JOIN entities e ON fe.entity_id = e.entity_id
@@ -540,9 +584,18 @@ export class MemoryStore {
     }
 
     const placeholders = factIds.map(() => "?").join(", ");
-    this.db.prepare(`UPDATE facts SET retrieval_count = retrieval_count + 1 WHERE fact_id IN (${placeholders})`).run(
-      ...factIds
-    );
+    // last_accessed_at bump piggybacks on the existing retrieval-count UPDATE
+    // so search/probe/reason/related all reset the decay clock through this
+    // single chokepoint. listFacts() deliberately does NOT call this — it's
+    // inspection, not reinforcement (Codex review #5).
+    this.db
+      .prepare(
+        `UPDATE facts
+         SET retrieval_count = retrieval_count + 1,
+             last_accessed_at = CURRENT_TIMESTAMP
+         WHERE fact_id IN (${placeholders})`
+      )
+      .run(...factIds);
   }
 }
 
@@ -644,11 +697,14 @@ function mapFactRowWithVector(row: FactRow): ScorableFact {
   if (typeof row.fts_rank_raw === "number") {
     fact.ftsRankRaw = row.fts_rank_raw;
   }
+  if (typeof row.last_touched_unix === "number") {
+    fact.lastTouchedUnix = row.last_touched_unix;
+  }
   return fact;
 }
 
 function stripScoringFields(scorable: ScorableFact): MemoryFact {
-  const { hrrVector: _v, ftsRankRaw: _r, ...rest } = scorable;
+  const { hrrVector: _v, ftsRankRaw: _r, lastTouchedUnix: _t, ...rest } = scorable;
   return rest;
 }
 
@@ -761,8 +817,28 @@ function tokenize(text: string): Set<string> {
   );
 }
 
+// Trust decay (#8). Half-life formula: at ageDays = halfLife, value is half
+// the original. halfLife <= 0 short-circuits to the input — that's the
+// default config and should stay zero-cost.
+export function decayedTrust(trust: number, ageDays: number, halfLifeDays: number): number {
+  if (halfLifeDays <= 0) return trust;
+  if (ageDays <= 0) return trust;
+  return trust * Math.pow(0.5, ageDays / halfLifeDays);
+}
+
+// SQL projects last_touched_unix as integer epoch seconds via
+// `unixepoch(COALESCE(last_accessed_at, created_at))`. This avoids
+// Date.parse on SQLite's "YYYY-MM-DD HH:MM:SS" format, which V8 treats as
+// local time and silently shifts ages by the local TZ offset. NULL only
+// when both timestamps are missing (impossible for inserted rows).
+export function ageDaysFromUnix(lastTouchedUnix: number | null | undefined, nowSec: number): number {
+  if (typeof lastTouchedUnix !== "number") return 0;
+  return Math.max(0, (nowSec - lastTouchedUnix) / 86400);
+}
+
 // Hermes-aligned blend: 40% FTS rank + 30% Jaccard + 30% HRR similarity,
-// then weighted by trust. Mirrors retrieval.py:91-94 in the Hermes plugin.
+// then weighted by trust (decayed if halfLifeDays > 0). Mirrors
+// retrieval.py:91-94 in the Hermes plugin.
 //
 // TODO(hrr-unbind-variant): Stored fact vectors come from `encodeFact`,
 // which binds content to `__hrr_role_content__`. We're comparing a raw
@@ -773,7 +849,9 @@ function scoreFact(
   fact: ScorableFact,
   queryTokens: Set<string>,
   queryVector: Float64Array | undefined,
-  ftsLookup: (fact: ScorableFact) => number
+  ftsLookup: (fact: ScorableFact) => number,
+  halfLifeDays: number,
+  nowSec: number
 ): ScorableFact {
   const factTokens = tokenize(`${fact.content} ${fact.tags}`);
   const overlap = [...queryTokens].filter((token) => factTokens.has(token)).length;
@@ -787,5 +865,6 @@ function scoreFact(
   const fts = ftsLookup(fact);
   const relevance = 0.4 * fts + 0.3 * jaccard + 0.3 * hrr;
 
-  return { ...fact, score: relevance * fact.trustScore };
+  const ageDays = ageDaysFromUnix(fact.lastTouchedUnix, nowSec);
+  return { ...fact, score: relevance * decayedTrust(fact.trustScore, ageDays, halfLifeDays) };
 }
