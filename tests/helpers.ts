@@ -55,12 +55,19 @@ export function readLastAccessed(dbPath: string, factId: number): string | null 
   }
 }
 
-export function backdateLastAccessed(dbPath: string, factId: number, daysAgo: number): void {
+export function backdateLastAccessed(
+  dbPath: string,
+  factId: number | number[],
+  daysAgo: number,
+): void {
+  const ids = Array.isArray(factId) ? factId : [factId];
+  if (ids.length === 0) return;
   const db = new Database(dbPath);
   try {
+    const placeholders = ids.map(() => "?").join(",");
     db.prepare(
-      `UPDATE facts SET last_accessed_at = datetime('now', '-${daysAgo} days') WHERE fact_id = ?`,
-    ).run(factId);
+      `UPDATE facts SET last_accessed_at = datetime('now', '-${daysAgo} days') WHERE fact_id IN (${placeholders})`,
+    ).run(...ids);
   } finally {
     db.close();
   }

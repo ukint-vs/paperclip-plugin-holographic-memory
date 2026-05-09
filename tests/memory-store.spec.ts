@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ageDaysFromUnix, decayedTrust, extractEntities, MemoryStore, toFtsQuery } from "../src/memory-store.js";
+import { backdateLastAccessed } from "./helpers.js";
 
 const dbs: Database.Database[] = [];
 const stores: MemoryStore[] = [];
@@ -764,10 +765,7 @@ describe("MemoryStore", () => {
       const store = new MemoryStore(dbPath);
       stores.push(store);
       const stale = store.addFact({ content: "alpha effective minTrust filter", trustScore: 0.7 });
-      const db = new Database(dbPath);
-      dbs.push(db);
-      db.prepare("UPDATE facts SET last_accessed_at = datetime('now', '-90 days') WHERE fact_id = ?")
-        .run(stale.factId);
+      backdateLastAccessed(dbPath, stale.factId, 90);
 
       const results = store.search("alpha effective minTrust filter", {
         limit: 5,
@@ -798,10 +796,7 @@ describe("MemoryStore", () => {
         content: '"BetaProtocol" fresh entry',
         trustScore: 0.7,
       });
-      const db = new Database(dbPath);
-      dbs.push(db);
-      db.prepare("UPDATE facts SET last_accessed_at = datetime('now', '-90 days') WHERE fact_id = ?")
-        .run(stale.factId);
+      backdateLastAccessed(dbPath, stale.factId, 90);
 
       const results = store.related("BetaProtocol", {
         limit: 5,
@@ -837,12 +832,7 @@ describe("MemoryStore", () => {
         );
       }
 
-      const db = new Database(dbPath);
-      dbs.push(db);
-      const placeholders = staleIds.map(() => "?").join(",");
-      db.prepare(
-        `UPDATE facts SET last_accessed_at = datetime('now', '-365 days') WHERE fact_id IN (${placeholders})`,
-      ).run(...staleIds);
+      backdateLastAccessed(dbPath, staleIds, 365);
 
       const results = store.search("alpha bravo", {
         limit: 5,

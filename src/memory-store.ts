@@ -60,6 +60,14 @@ function lastTouchedUnixSql(prefix: "" | "f." = ""): string {
   return `COALESCE(unixepoch(${prefix}last_accessed_at), unixepoch(${prefix}created_at)) AS last_touched_unix`;
 }
 
+// Search candidate over-fetch headroom. With decay disabled, 3x gives
+// scoreFact reordering room over the SQL ORDER BY. With decay enabled,
+// the post-scoring filter can discard every stale candidate above the
+// cutoff, so 10x keeps the candidate pool wide enough that fresh rows
+// beyond the FTS-rank top still surface even when the leaders are stale.
+const CANDIDATE_MULTIPLIER_BASE = 3;
+const CANDIDATE_MULTIPLIER_WITH_DECAY = 10;
+
 export class MemoryStore {
   readonly dbPath: string;
   private readonly db: Database.Database;
@@ -93,14 +101,8 @@ export class MemoryStore {
       return [];
     }
 
-    // Over-fetch headroom for the candidate pool. With decay disabled, a 3x
-    // multiplier is enough to give scoreFact some reordering room over the
-    // SQL ORDER BY. With decay enabled, the post-scoring filter can discard
-    // every stale candidate above the cutoff — if the top-`limit*3` rows by
-    // FTS rank happen to all be stale, search returns 0 even when fresh rows
-    // beyond the cap would qualify. Bumping to 10x makes that collapse far
-    // less likely without pulling in unbounded rows. (PR #30 Codex review.)
-    const candidateMultiplier = halfLifeDays > 0 ? 10 : 3;
+    const candidateMultiplier =
+      halfLifeDays > 0 ? CANDIDATE_MULTIPLIER_WITH_DECAY : CANDIDATE_MULTIPLIER_BASE;
     const byText = this.searchFts(ftsQuery, limit * candidateMultiplier, minTrust, companyId);
     const remaining = Math.max(0, limit * candidateMultiplier - byText.length);
 
@@ -125,14 +127,14 @@ export class MemoryStore {
     const queryVector = this.hrrEnabled ? encodeText(query, this.hrrDim) : undefined;
     const nowSec = Date.now() / 1000;
 
-    // SQL gate (`COALESCE(trust_score, 0) >= minTrust`) is a cheap pre-filter
-    // on raw trust; with decay enabled, a fact whose effective trust has fallen
-    // below minTrust still passes that gate. Re-apply minTrust here against
-    // the post-decay value so users see "minTrust = effective trust" instead
-    // of "minTrust = baseline raw trust." (PR #30 review.)
+    // SQL gate on raw trust (`COALESCE(trust_score, 0) >= minTrust`) is a
+    // cheap pre-filter; with decay enabled, a fact whose effective trust has
+    // fallen below minTrust still passes that gate. Re-apply minTrust here
+    // against the post-decay value so the cutoff means "effective trust"
+    // (what users see in scored output) rather than "baseline raw trust."
     const scored = candidates
       .map((fact) => scoreFact(fact, queryTokens, queryVector, ftsLookup, halfLifeDays, nowSec))
-      .filter((fact) => (fact.effectiveTrust ?? fact.trustScore) >= minTrust)
+      .filter((fact) => (fact.effectiveTrust ?? 0) >= minTrust)
       .sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || b.trustScore - a.trustScore || a.factId - b.factId)
       .slice(0, limit);
 
@@ -363,8 +365,8 @@ export class MemoryStore {
     const nowSec = Date.now() / 1000;
     // Mirror search()'s post-decay minTrust filter and tie-breakers so
     // related ranking is deterministic on score ties and respects the same
-    // "minTrust = effective trust" semantics. (PR #30 review.)
-    const results = rows
+    // "minTrust = effective trust" semantics.
+    const results: ScorableFact[] = rows
       .map((row) => {
         const vector = bytesToPhases(row.hrr_vector ?? Buffer.alloc(0));
         const residual = unbind(vector, entityVector);
@@ -374,7 +376,7 @@ export class MemoryStore {
         const score = ((similarity(residual, roleContent) + 1) / 2) * effectiveTrust;
         return { ...mapFactRow(row), effectiveTrust, score };
       })
-      .filter((fact) => fact.effectiveTrust >= minTrust)
+      .filter((fact) => (fact.effectiveTrust ?? 0) >= minTrust)
       .sort(
         (a, b) =>
           (b.score ?? 0) - (a.score ?? 0) ||
@@ -384,7 +386,7 @@ export class MemoryStore {
       .slice(0, limit);
 
     this.incrementRetrievalCounts(results.map((fact) => fact.factId));
-    return results.map(({ effectiveTrust: _e, ...fact }) => fact);
+    return results.map(stripScoringFields);
   }
 
   listFacts(options: MemorySearchOptions & { category?: string } = {}): MemoryFact[] {
