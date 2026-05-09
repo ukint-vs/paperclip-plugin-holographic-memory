@@ -294,35 +294,28 @@ describe("mergeCodexUninstall", () => {
     expect(outcome.reason).toMatch(/already absent/);
   });
 
-  it("refuses to touch a config with BEGIN-without-END (corrupt marker)", () => {
+  it("throws on a config with BEGIN-without-END (corrupt marker)", () => {
+    // Throw → run() exits 2 → automation aborts. Returning changed:false
+    // would misleadingly report success and leave the entry in place,
+    // dangling after `npm uninstall` removes the bin. Mirrors the
+    // malformed-JSON/TOML contract.
     const existing = "# managed by paperclip-plugin-holographic-memory\nbroken = 1\n";
-    const outcome = mergeCodexUninstall(existing);
-    expect(outcome.changed).toBe(false);
-    expect(outcome.reason).toMatch(/corrupt/);
-    expect(outcome.reason).toMatch(/BEGIN.*without.*END/);
-    // File untouched.
-    expect(outcome.output).toBe(existing);
+    expect(() => mergeCodexUninstall(existing)).toThrow(/BEGIN marker without END/);
   });
 
-  it("refuses to touch a config with END-without-BEGIN (corrupt marker)", () => {
+  it("throws on a config with END-without-BEGIN (corrupt marker)", () => {
     const existing = "model = 1\n# end paperclip-plugin-holographic-memory\n";
-    const outcome = mergeCodexUninstall(existing);
-    expect(outcome.changed).toBe(false);
-    expect(outcome.reason).toMatch(/corrupt/);
-    expect(outcome.reason).toMatch(/END.*without.*BEGIN/);
+    expect(() => mergeCodexUninstall(existing)).toThrow(/END marker without BEGIN/);
   });
 
-  it("refuses to touch a config with END-before-BEGIN (corrupt order)", () => {
+  it("throws on a config with END-before-BEGIN (corrupt order)", () => {
     const existing = [
       "# end paperclip-plugin-holographic-memory",
       "stuff = 1",
       "# managed by paperclip-plugin-holographic-memory",
       "",
     ].join("\n");
-    const outcome = mergeCodexUninstall(existing);
-    expect(outcome.changed).toBe(false);
-    expect(outcome.reason).toMatch(/corrupt/);
-    expect(outcome.reason).toMatch(/END.*before.*BEGIN/);
+    expect(() => mergeCodexUninstall(existing)).toThrow(/END marker before BEGIN/);
   });
 
   it("does not match marker text inside a user-quoted comment", () => {

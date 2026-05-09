@@ -412,19 +412,20 @@ export function mergeCodexUninstall(existing: string): MergeOutcome {
     return { changed: false, reason: "marker block already absent", output: existing };
   }
   // Partial-marker corruption: BEGIN-without-END, END-without-BEGIN, or
-  // END-before-BEGIN. Don't try to repair — refuse to touch the file with
-  // a clear diagnostic so the user can hand-fix or use --print to regenerate.
+  // END-before-BEGIN. Throw so run() exits 2 instead of falsely reporting
+  // a clean uninstall — otherwise `setup --uninstall && npm uninstall`
+  // automation succeeds with the entry still wired up, dangling after
+  // npm-uninstall removes the bin. The malformed-JSON/TOML guard paths
+  // throw for the same reason; mirror that contract here.
   if (!startMatch || !endMatch || endMatch.index < startMatch.index) {
     const which = !startMatch
       ? "END marker without BEGIN"
       : !endMatch
         ? "BEGIN marker without END"
         : "END marker before BEGIN";
-    return {
-      changed: false,
-      reason: `marker block corrupt (${which}); leaving file untouched. Hand-fix the markers or use --print to regenerate.`,
-      output: existing,
-    };
+    throw new Error(
+      `Refusing to uninstall: marker block corrupt (${which}). Hand-fix the markers in the codex config or use --print to regenerate.`,
+    );
   }
   // Strip from BEGIN line through END line, including the END's trailing
   // newline if present so we don't leave an orphan blank line.
