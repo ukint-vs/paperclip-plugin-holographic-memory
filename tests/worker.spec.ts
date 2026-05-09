@@ -38,6 +38,7 @@ function baseConfig(dbPath: string, overrides: Partial<HolographicMemoryConfig> 
     retainEnabled: true,
     minTrustScore: 0.3,
     maxFactsPerRecall: 10,
+    trustHalfLifeDays: 0,
     ...overrides
   };
 }
@@ -405,6 +406,43 @@ describe("dispatchAction — recall_context", () => {
     );
     // The seeded fact in createDb() matches.
     expect(result.content).toContain("Vara wallet supports IDL-aware calls");
+  });
+
+  it("live-search fallback applies trustHalfLifeDays from config (#8 propagation)", async () => {
+    // Codex review caught that handleRecallContext's live-search fallback at
+    // worker.ts:489-493 builds its own `opts` object. Without explicit
+    // halfLifeDays propagation, decay silently no-ops on this code path even
+    // when enabled in config. Set up two facts at identical trust (so any
+    // ranking difference must come from decay) with one backdated, force a
+    // cache miss, and verify the fresh fact ranks first.
+    const dbPath = createDb();
+    const config = baseConfig(dbPath, { trustHalfLifeDays: 30 });
+
+    // Open MemoryStore so migrate() adds last_accessed_at on this dbPath,
+    // then insert two facts via SQL (createDb seeded its own legacy schema).
+    const store = new MemoryStore(dbPath);
+    const stale = store.addFact({ content: "alpha live recall decay", trustScore: 0.7 });
+    const fresh = store.addFact({ content: "beta live recall decay", trustScore: 0.7 });
+    store.close();
+    const db = new Database(dbPath);
+    db.prepare("UPDATE facts SET last_accessed_at = datetime('now', '-90 days') WHERE fact_id = ?")
+      .run(stale.factId);
+    db.close();
+
+    const { ctx } = fakeStateCtx();
+    const result = await dispatchAction(
+      { action: "recall_context", query: "live recall decay", min_trust: 0 },
+      config,
+      ctx,
+      { ...FAKE_RUN_CTX, runId: "unknown-run-decay" }
+    );
+
+    const content = result.content ?? "";
+    const idxFresh = content.indexOf(`id=${fresh.factId};`);
+    const idxStale = content.indexOf(`id=${stale.factId};`);
+    expect(idxFresh).toBeGreaterThanOrEqual(0);
+    expect(idxStale).toBeGreaterThanOrEqual(0);
+    expect(idxFresh).toBeLessThan(idxStale);
   });
 
   it("returns guidance when nothing resolves", async () => {

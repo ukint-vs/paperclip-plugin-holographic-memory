@@ -9,7 +9,8 @@ const DEFAULT_CONFIG: HolographicMemoryConfig = {
   recallEnabled: true,
   retainEnabled: false,
   minTrustScore: 0.3,
-  maxFactsPerRecall: 10
+  maxFactsPerRecall: 10,
+  trustHalfLifeDays: 0
 };
 
 export function expandHome(input: string): string {
@@ -36,6 +37,12 @@ export function resolvePluginConfig(
     minTrustScore: normalizeNumber(rawConfig.minTrustScore, DEFAULT_CONFIG.minTrustScore, 0, 1),
     maxFactsPerRecall: Math.floor(
       normalizeNumber(rawConfig.maxFactsPerRecall, DEFAULT_CONFIG.maxFactsPerRecall, 1, 50)
+    ),
+    trustHalfLifeDays: normalizeNumber(
+      rawConfig.trustHalfLifeDays,
+      DEFAULT_CONFIG.trustHalfLifeDays,
+      0,
+      3650
     )
   };
 }

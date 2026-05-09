@@ -3,7 +3,8 @@ import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { extractEntities, MemoryStore, toFtsQuery } from "../src/memory-store.js";
+import { ageDaysFromUnix, decayedTrust, extractEntities, MemoryStore, toFtsQuery } from "../src/memory-store.js";
+import { backdateLastAccessed } from "./helpers.js";
 
 const dbs: Database.Database[] = [];
 const stores: MemoryStore[] = [];
@@ -554,6 +555,319 @@ describe("MemoryStore", () => {
       dbs.push(db);
       const result = db.pragma("busy_timeout") as Array<{ timeout: number }>;
       expect(result[0]?.timeout).toBe(5000);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Trust decay over time (#8). Tests cover the pure decay helper, the SQL
+  // unixepoch projection (TZ-safe), the scoring path, the read-side
+  // last_accessed_at bump, the recordFeedback split, and the migration
+  // fallback to created_at for legacy rows.
+  // -------------------------------------------------------------------------
+  describe("trust decay (#8)", () => {
+    it("decayedTrust(): halfLife <= 0 returns trust unchanged (fast path)", () => {
+      expect(decayedTrust(0.8, 30, 0)).toBe(0.8);
+      expect(decayedTrust(0.8, 30, -1)).toBe(0.8);
+    });
+
+    it("decayedTrust(): ageDays = 0 returns trust unchanged", () => {
+      expect(decayedTrust(0.8, 0, 90)).toBe(0.8);
+    });
+
+    it("decayedTrust(): ageDays = halfLife returns trust * 0.5", () => {
+      expect(decayedTrust(0.8, 30, 30)).toBeCloseTo(0.4, 10);
+    });
+
+    it("decayedTrust(): many half-lives drives trust toward zero", () => {
+      // ~33 half-lives → ~1.16e-10 of input
+      expect(decayedTrust(0.8, 1000, 30)).toBeLessThan(1e-9);
+    });
+
+    it("CRITICAL REGRESSION: halfLifeDays = 0 preserves prior ranking", () => {
+      const dbPath = tempDbPath();
+      const store = new MemoryStore(dbPath);
+      stores.push(store);
+      const fresh = store.addFact({ content: "alpha vara wallet idl", trustScore: 0.8 });
+      const stale = store.addFact({ content: "beta vara wallet idl", trustScore: 0.6 });
+      // Backdate the higher-trust fact 365 days. With halfLifeDays = 0
+      // (default), age must not affect ranking — trust 0.8 still beats 0.6.
+      const db = new Database(dbPath);
+      dbs.push(db);
+      db.prepare("UPDATE facts SET last_accessed_at = datetime('now', '-365 days') WHERE fact_id = ?")
+        .run(fresh.factId);
+
+      const results = store.search("vara wallet idl", { limit: 5, minTrust: 0, halfLifeDays: 0 });
+      expect(results[0]?.factId).toBe(fresh.factId);
+      expect(results[1]?.factId).toBe(stale.factId);
+    });
+
+    it("halfLifeDays > 0: stale fact ranks below fresh fact at same trust", () => {
+      const dbPath = tempDbPath();
+      const store = new MemoryStore(dbPath);
+      stores.push(store);
+      const stale = store.addFact({ content: "alpha vara wallet idl", trustScore: 0.7 });
+      const fresh = store.addFact({ content: "beta vara wallet idl", trustScore: 0.7 });
+      const db = new Database(dbPath);
+      dbs.push(db);
+      // 60 days ≈ 2 half-lives at halfLifeDays=30 → ~0.25 of original trust.
+      db.prepare("UPDATE facts SET last_accessed_at = datetime('now', '-60 days') WHERE fact_id = ?")
+        .run(stale.factId);
+
+      const results = store.search("vara wallet idl", { limit: 5, minTrust: 0, halfLifeDays: 30 });
+      expect(results[0]?.factId).toBe(fresh.factId);
+      expect(results[1]?.factId).toBe(stale.factId);
+    });
+
+    it("related() applies decay on its scored output", () => {
+      const dbPath = tempDbPath();
+      const store = new MemoryStore(dbPath);
+      stores.push(store);
+      // Two facts referencing the same entity; same trust; one aged out.
+      const stale = store.addFact({
+        content: '"OpenClaw" stale relationship note',
+        trustScore: 0.7
+      });
+      const fresh = store.addFact({
+        content: '"OpenClaw" fresh relationship note',
+        trustScore: 0.7
+      });
+      const db = new Database(dbPath);
+      dbs.push(db);
+      db.prepare("UPDATE facts SET last_accessed_at = datetime('now', '-90 days') WHERE fact_id = ?")
+        .run(stale.factId);
+
+      const results = store.related("OpenClaw", { limit: 5, minTrust: 0, halfLifeDays: 30 });
+      expect(results.length).toBeGreaterThanOrEqual(1);
+      // Fresh outranks stale once decay is on.
+      const idxFresh = results.findIndex((r) => r.factId === fresh.factId);
+      const idxStale = results.findIndex((r) => r.factId === stale.factId);
+      if (idxFresh >= 0 && idxStale >= 0) {
+        expect(idxFresh).toBeLessThan(idxStale);
+      }
+    });
+
+    it("TZ correctness: unixepoch projection is independent of process.env.TZ", () => {
+      // SQLite's CURRENT_TIMESTAMP emits "YYYY-MM-DD HH:MM:SS" in UTC with no
+      // marker. Date.parse treats that as local time and silently shifts
+      // ages by the local TZ offset. The unixepoch projection in the SELECT
+      // sidesteps this — running the same scoring under a non-UTC TZ must
+      // produce identical results.
+      const ageDaysAt = (tz: string): number => {
+        const prev = process.env.TZ;
+        process.env.TZ = tz;
+        try {
+          // Fixed nowSec and lastTouched — values are in UTC seconds, JS
+          // does not interpret them as wall-clock strings, so the helper
+          // must be TZ-invariant.
+          const nowSec = 1_700_000_000;
+          const lastTouched = nowSec - 30 * 86400;
+          return ageDaysFromUnix(lastTouched, nowSec);
+        } finally {
+          process.env.TZ = prev;
+        }
+      };
+      expect(ageDaysAt("UTC")).toBe(30);
+      expect(ageDaysAt("Asia/Tbilisi")).toBe(30);
+      expect(ageDaysAt("America/Los_Angeles")).toBe(30);
+    });
+
+    it("probe() does NOT apply decay (raw trust ordering preserved)", () => {
+      const dbPath = tempDbPath();
+      const store = new MemoryStore(dbPath);
+      stores.push(store);
+      // Two entity-linked facts; the higher-trust one is also stale.
+      const staleHighTrust = store.addFact({
+        content: '"GearProtocol" canonical reference',
+        trustScore: 0.9
+      });
+      store.addFact({
+        content: '"GearProtocol" recent low-trust note',
+        trustScore: 0.3
+      });
+      const db = new Database(dbPath);
+      dbs.push(db);
+      db.prepare("UPDATE facts SET last_accessed_at = datetime('now', '-365 days') WHERE fact_id = ?")
+        .run(staleHighTrust.factId);
+
+      // probe routes through searchEntities ORDER BY trust_score DESC. Even
+      // if the caller could request decay, probe currently does not pass
+      // halfLifeDays through to the scoring path — by design.
+      const results = store.probe("GearProtocol", { limit: 5, minTrust: 0, halfLifeDays: 30 });
+      expect(results[0]?.factId).toBe(staleHighTrust.factId);
+    });
+
+    it("search() bumps last_accessed_at on returned facts", () => {
+      const dbPath = tempDbPath();
+      const store = new MemoryStore(dbPath);
+      stores.push(store);
+      const added = store.addFact({ content: "alpha read-bump test", trustScore: 0.8 });
+      const db = new Database(dbPath);
+      dbs.push(db);
+      db.prepare("UPDATE facts SET last_accessed_at = NULL WHERE fact_id = ?").run(added.factId);
+
+      store.search("alpha read-bump test", { limit: 1, minTrust: 0 });
+
+      const row = db
+        .prepare("SELECT last_accessed_at FROM facts WHERE fact_id = ?")
+        .get(added.factId) as { last_accessed_at: string | null };
+      expect(row.last_accessed_at).not.toBeNull();
+    });
+
+    it("recordFeedback(helpful=true) bumps last_accessed_at", () => {
+      const dbPath = tempDbPath();
+      const store = new MemoryStore(dbPath);
+      stores.push(store);
+      const added = store.addFact({ content: "feedback positive bump", trustScore: 0.5 });
+      const db = new Database(dbPath);
+      dbs.push(db);
+      db.prepare("UPDATE facts SET last_accessed_at = NULL WHERE fact_id = ?").run(added.factId);
+
+      store.recordFeedback(added.factId, true);
+
+      const row = db
+        .prepare("SELECT last_accessed_at FROM facts WHERE fact_id = ?")
+        .get(added.factId) as { last_accessed_at: string | null };
+      expect(row.last_accessed_at).not.toBeNull();
+    });
+
+    it("EDGE CASE: recordFeedback(helpful=false) does NOT bump last_accessed_at", () => {
+      const dbPath = tempDbPath();
+      const store = new MemoryStore(dbPath);
+      stores.push(store);
+      const added = store.addFact({ content: "feedback negative no-bump", trustScore: 0.5 });
+      const db = new Database(dbPath);
+      dbs.push(db);
+      // Force a known-stale timestamp so we can detect any unwanted touch.
+      db.prepare("UPDATE facts SET last_accessed_at = datetime('now', '-30 days') WHERE fact_id = ?")
+        .run(added.factId);
+      const before = (
+        db.prepare("SELECT last_accessed_at FROM facts WHERE fact_id = ?").get(added.factId) as {
+          last_accessed_at: string;
+        }
+      ).last_accessed_at;
+
+      store.recordFeedback(added.factId, false);
+
+      const after = (
+        db.prepare("SELECT last_accessed_at FROM facts WHERE fact_id = ?").get(added.factId) as {
+          last_accessed_at: string;
+        }
+      ).last_accessed_at;
+      expect(after).toBe(before);
+    });
+
+    it("minTrust filters facts whose effective (decayed) trust drops below the threshold", () => {
+      // Fact has raw trust 0.7 — passes the SQL gate at minTrust=0.3 — but
+      // after 90d at halfLife=30 (3 half-lives) its effective trust is
+      // ~0.0875, well below the cutoff. Without the post-decay filter the
+      // fact would still surface; with it, search returns empty.
+      const dbPath = tempDbPath();
+      const store = new MemoryStore(dbPath);
+      stores.push(store);
+      const stale = store.addFact({ content: "alpha effective minTrust filter", trustScore: 0.7 });
+      backdateLastAccessed(dbPath, stale.factId, 90);
+
+      const results = store.search("alpha effective minTrust filter", {
+        limit: 5,
+        minTrust: 0.3,
+        halfLifeDays: 30,
+      });
+      expect(results).toHaveLength(0);
+
+      // Same query with decay disabled returns the fact (raw trust 0.7 > 0.3).
+      const baseline = store.search("alpha effective minTrust filter", {
+        limit: 5,
+        minTrust: 0.3,
+        halfLifeDays: 0,
+      });
+      expect(baseline).toHaveLength(1);
+    });
+
+    it("related() applies the same effective-minTrust filter and tie-breakers as search()", () => {
+      const dbPath = tempDbPath();
+      const store = new MemoryStore(dbPath);
+      stores.push(store);
+      // Two related facts at trust 0.7; one is decayed past minTrust.
+      const stale = store.addFact({
+        content: '"BetaProtocol" stale entry',
+        trustScore: 0.7,
+      });
+      const fresh = store.addFact({
+        content: '"BetaProtocol" fresh entry',
+        trustScore: 0.7,
+      });
+      backdateLastAccessed(dbPath, stale.factId, 90);
+
+      const results = store.related("BetaProtocol", {
+        limit: 5,
+        minTrust: 0.3,
+        halfLifeDays: 30,
+      });
+      // Stale fact (effective trust ~0.0875) filtered out; fresh remains.
+      expect(results.find((f) => f.factId === stale.factId)).toBeUndefined();
+      expect(results.find((f) => f.factId === fresh.factId)).toBeDefined();
+    });
+
+    it("over-fetches candidates when decay is enabled so stale top-rank matches don't starve fresh matches", () => {
+      // Codex PR review caught: with halfLifeDays=0 the SQL pre-fetch caps at
+      // limit*3 candidates, which is fine. With decay on and many top-rank
+      // matches stale, that cap can wipe the entire candidate pool via the
+      // post-decay filter — fresh rows beyond the cap never get a chance.
+      // Verify search returns the fresh rows when 30 stale ones come first
+      // in FTS rank order with a limit of 5.
+      const dbPath = tempDbPath();
+      const store = new MemoryStore(dbPath);
+      stores.push(store);
+
+      const staleIds: number[] = [];
+      for (let i = 0; i < 30; i += 1) {
+        staleIds.push(
+          store.addFact({ content: `stale candidate alpha bravo ${i}`, trustScore: 0.7 }).factId,
+        );
+      }
+      const freshIds: number[] = [];
+      for (let i = 0; i < 5; i += 1) {
+        freshIds.push(
+          store.addFact({ content: `fresh candidate alpha bravo ${i}`, trustScore: 0.7 }).factId,
+        );
+      }
+
+      backdateLastAccessed(dbPath, staleIds, 365);
+
+      const results = store.search("alpha bravo", {
+        limit: 5,
+        minTrust: 0.3,
+        halfLifeDays: 30,
+      });
+      // All 5 fresh rows should be returned. Without the wider candidate
+      // pool, the top-15 (limit*3) would have been the stale rows, all
+      // filtered out, and `results` would have been empty.
+      expect(results).toHaveLength(5);
+      for (const r of results) {
+        expect(freshIds).toContain(r.factId);
+      }
+    });
+
+    it("migration: legacy rows without last_accessed_at decay from created_at via COALESCE", () => {
+      // Open a DB with the modern schema (so migrate() runs), insert a row,
+      // then NULL out last_accessed_at and backdate created_at to simulate a
+      // pre-migration row. Decay should then key off created_at.
+      const dbPath = tempDbPath();
+      const store = new MemoryStore(dbPath);
+      stores.push(store);
+      const stale = store.addFact({ content: "alpha legacy migration", trustScore: 0.7 });
+      const fresh = store.addFact({ content: "beta legacy migration", trustScore: 0.7 });
+      const db = new Database(dbPath);
+      dbs.push(db);
+      // Stale row: no last_accessed_at, but created 90 days ago (2 half-lives).
+      db.prepare(
+        "UPDATE facts SET last_accessed_at = NULL, created_at = datetime('now', '-90 days') WHERE fact_id = ?"
+      ).run(stale.factId);
+
+      const results = store.search("legacy migration", { limit: 5, minTrust: 0, halfLifeDays: 30 });
+      // Fresh outranks stale because COALESCE picked up the backdated created_at.
+      expect(results[0]?.factId).toBe(fresh.factId);
+      expect(results[1]?.factId).toBe(stale.factId);
     });
   });
 });

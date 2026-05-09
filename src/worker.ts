@@ -164,6 +164,7 @@ export async function handleRunStarted(
     facts = store.search(query, {
       limit: config.maxFactsPerRecall,
       minTrust: config.minTrustScore,
+      halfLifeDays: config.trustHalfLifeDays,
       ...(companyId ? { companyId } : {})
     });
   } catch (error) {
@@ -487,9 +488,13 @@ async function handleRecallContext(
     // recall_context's live-search fallback uses maxFactsPerRecall (not the
     // dispatch read-handler default of 5) so the cached-vs-search split
     // behaves consistently. companyId scoping mirrors the dispatch path.
-    const opts: { limit: number; minTrust: number; companyId?: string } = {
+    // halfLifeDays threaded through so decay applies on this code path too;
+    // without it, the live fallback would silently use raw trust ranking
+    // while the cached path reflects whatever decay was applied at write.
+    const opts: { limit: number; minTrust: number; halfLifeDays: number; companyId?: string } = {
       limit: params.limit ?? config.maxFactsPerRecall,
-      minTrust: params.min_trust ?? config.minTrustScore
+      minTrust: params.min_trust ?? config.minTrustScore,
+      halfLifeDays: config.trustHalfLifeDays
     };
     if (runCtx?.companyId) opts.companyId = runCtx.companyId;
     const facts = store.search(params.query, opts);

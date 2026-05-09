@@ -1,6 +1,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import type { ToolRunContext } from "@paperclipai/plugin-sdk";
 import type { HolographicMemoryConfig } from "../src/types.js";
 
@@ -27,6 +28,7 @@ export function baseConfig(
     retainEnabled: true,
     minTrustScore: 0.3,
     maxFactsPerRecall: 10,
+    trustHalfLifeDays: 0,
     ...overrides,
   };
 }
@@ -36,4 +38,37 @@ export function baseConfig(
 // fields the handlers under test never read.
 export function fakeRunCtx(companyId: string): ToolRunContext {
   return { companyId } as ToolRunContext;
+}
+
+// Direct-DB inspection helpers for trust-decay (#8) tests. Both open and
+// close a fresh better-sqlite3 connection per call so they don't fight the
+// store registry's writer lock.
+export function readLastAccessed(dbPath: string, factId: number): string | null {
+  const db = new Database(dbPath);
+  try {
+    const row = db.prepare("SELECT last_accessed_at FROM facts WHERE fact_id = ?").get(factId) as
+      | { last_accessed_at: string | null }
+      | undefined;
+    return row?.last_accessed_at ?? null;
+  } finally {
+    db.close();
+  }
+}
+
+export function backdateLastAccessed(
+  dbPath: string,
+  factId: number | number[],
+  daysAgo: number,
+): void {
+  const ids = Array.isArray(factId) ? factId : [factId];
+  if (ids.length === 0) return;
+  const db = new Database(dbPath);
+  try {
+    const placeholders = ids.map(() => "?").join(",");
+    db.prepare(
+      `UPDATE facts SET last_accessed_at = datetime('now', '-${daysAgo} days') WHERE fact_id IN (${placeholders})`,
+    ).run(...ids);
+  } finally {
+    db.close();
+  }
 }

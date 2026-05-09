@@ -8,7 +8,7 @@ import {
 } from "../src/dispatch.js";
 import { writeRecallCache } from "../src/recall-cache.js";
 import type { HolographicMemoryConfig, RecallState } from "../src/types.js";
-import { baseConfig, fakeRunCtx, tempDb } from "./helpers.js";
+import { backdateLastAccessed, baseConfig, fakeRunCtx, readLastAccessed, tempDb } from "./helpers.js";
 import type { MemoryStore } from "../src/memory-store.js";
 
 afterEach(() => {
@@ -139,6 +139,47 @@ describe("dispatchStandaloneAction — gates", () => {
     const config = baseConfig(tempDb());
     const result = await dispatchStandaloneAction({ action: "bogus" }, config);
     expect(result.error).toBe("Unknown memory action: bogus");
+  });
+
+  it("search propagates trustHalfLifeDays from config (decay applied end-to-end)", async () => {
+    // Verify the dispatch → readOptions → store.search path actually carries
+    // halfLifeDays. We set up a stale + fresh fact at the same trust, enable
+    // a 30-day half-life via config, and confirm the dispatched search
+    // returns fresh-first. Without the propagation, the order would collapse
+    // back to insertion order at trust 0.7 (tie-break by factId).
+    const config = baseConfig(tempDb(), { trustHalfLifeDays: 30, retainEnabled: true });
+    const store = getStore(config);
+    const stale = store.addFact({ content: "alpha decay propagation", trustScore: 0.7 });
+    const fresh = store.addFact({ content: "beta decay propagation", trustScore: 0.7 });
+    backdateLastAccessed(config.dbPath, stale.factId, 90);
+
+    const result = await dispatchStandaloneAction(
+      { action: "search", query: "decay propagation", min_trust: 0 },
+      config,
+    );
+    const idxFresh = result.content.indexOf(`id=${fresh.factId};`);
+    const idxStale = result.content.indexOf(`id=${stale.factId};`);
+    expect(idxFresh).toBeGreaterThanOrEqual(0);
+    expect(idxStale).toBeGreaterThanOrEqual(0);
+    expect(idxFresh).toBeLessThan(idxStale);
+  });
+
+  it("feedback {helpful:true} bumps last_accessed_at end-to-end through dispatcher", async () => {
+    const config = baseConfig(tempDb(), { retainEnabled: true });
+    const added = JSON.parse(
+      (await dispatchStandaloneAction({ action: "add", content: "fb decay bump" }, config)).content,
+    );
+    backdateLastAccessed(config.dbPath, added.factId, 7);
+    const before = readLastAccessed(config.dbPath, added.factId);
+
+    await dispatchStandaloneAction(
+      { action: "feedback", fact_id: added.factId, helpful: true },
+      config,
+    );
+
+    const after = readLastAccessed(config.dbPath, added.factId);
+    expect(after).not.toBe(before);
+    expect(after).not.toBeNull();
   });
 });
 

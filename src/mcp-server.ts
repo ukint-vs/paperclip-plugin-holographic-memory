@@ -56,6 +56,7 @@ export function resolveStandaloneConfig(env: NodeJS.ProcessEnv = process.env): H
     maxFactsPerRecall: Math.floor(
       envNumber(env.PAPERCLIP_HOLO_MEMORY_MAX_RECALL, 10, 1, 50),
     ),
+    trustHalfLifeDays: envNumber(env.PAPERCLIP_HOLO_MEMORY_TRUST_HALF_LIFE_DAYS, 0, 0, 3650),
   };
 }
 

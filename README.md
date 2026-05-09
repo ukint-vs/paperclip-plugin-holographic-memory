@@ -64,13 +64,22 @@ curl -X POST http://127.0.0.1:3100/api/plugins/install \
   "recallEnabled": true,
   "retainEnabled": false,
   "minTrustScore": 0.3,
-  "maxFactsPerRecall": 10
+  "maxFactsPerRecall": 10,
+  "trustHalfLifeDays": 0
 }
 ```
 
 `retainEnabled` defaults to `false`. While off, `add`, `update`, and `remove`
 return `Memory retain is disabled. Set retainEnabled=true in plugin config.`
 Read actions are gated by `recallEnabled`.
+
+`trustHalfLifeDays` enables age-based trust decay on the scored read paths
+(`search`, `related`). Default `0` disables decay; set to a positive number of
+days (e.g. `90`) to make a fact's effective trust fall to half after that many
+days since its last reinforcement. `last_accessed_at` is bumped on every
+recall and on positive feedback; negative feedback leaves the clock alone so
+the penalty isn't diluted. `list` / `probe` / `reason` keep raw `trust_score`
+ordering by design.
 
 ## Populating the DB
 

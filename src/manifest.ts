@@ -60,6 +60,15 @@ const manifest: PaperclipPluginManifestV1 = {
         minimum: 1,
         maximum: 50,
       },
+      trustHalfLifeDays: {
+        type: "number",
+        title: "Trust half-life (days)",
+        description:
+          "Days for trust to decay to 50%. Set to 0 (default) to disable decay. Applies to scored read paths (search, related).",
+        default: 0,
+        minimum: 0,
+        maximum: 3650,
+      },
     },
   },
   tools: [
