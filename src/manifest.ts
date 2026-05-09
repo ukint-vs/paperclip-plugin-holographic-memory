@@ -1,10 +1,33 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { PaperclipPluginManifestV1, PluginToolDeclaration } from "@paperclipai/plugin-sdk";
 import { toJsonSchema } from "./tool-schema.js";
+
+// Read version from package.json at module init so the manifest's `version`
+// field (advertised to Paperclip's plugin loader and surfaced in Settings UI)
+// tracks package.json without manual sync. Same approach as
+// `src/mcp-server.ts` PACKAGE_VERSION; pre-0.4.0 this was hardcoded `"0.1.0"`
+// and stayed there across releases. Resolves both in src/ (../package.json)
+// and dist/ (sibling to dist/, also ../package.json).
+function readPackageVersion(): string {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const pkgPath = join(here, "..", "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string };
+    return pkg.version ?? "0.0.0";
+  } catch {
+    // Sandboxed contexts where package.json isn't readable — never expected
+    // in the dist-loaded path, but keeps the manifest constructable rather
+    // than throwing at import time.
+    return "0.0.0";
+  }
+}
 
 const manifest: PaperclipPluginManifestV1 = {
   id: "paperclip-plugin-holographic-memory",
   apiVersion: 1,
-  version: "0.1.0",
+  version: readPackageVersion(),
   displayName: "Holographic Memory",
   author: "Vadim Smirnov <ukint-vs@proton.me>",
   description:
